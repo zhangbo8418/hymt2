@@ -40,7 +40,8 @@ nvcc --version
 if not exist build_msvc mkdir build_msvc
 del /q build_msvc\*.obj build_msvc\*.exe 2>nul
 
-set CFLAGS=/nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /DHYMT2_CUDA=1 /DHYMT2_NO_VULKAN /D_WIN32_WINNT=0x0601 /DWINVER=0x0601 /Ithird_party\vulkan /Isrc /Iinclude /I"%CUDA_INC%"
+rem Universal: CUDA + Vulkan (runtime LoadLibrary) + CPU. Do not define HYMT2_NO_VULKAN.
+set CFLAGS=/nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /DHYMT2_CUDA=1 /D_WIN32_WINNT=0x0601 /DWINVER=0x0601 /Ithird_party\vulkan /Isrc /Iinclude /I"%CUDA_INC%"
 
 echo === nvcc kernels ===
 nvcc -O3 -c -Xcompiler "/MD /nologo" -o build_msvc\cuda_kernels.obj src\cuda_kernels.cu
@@ -72,6 +73,10 @@ if errorlevel 1 goto fail
 cl %CFLAGS% /c /Fobuild_msvc\metal_stub.obj src\metal_stub.c
 if errorlevel 1 goto fail
 
+set "CUDART_DLL="
+for %%F in ("%CUDA_BIN%cudart64_*.dll") do set "CUDART_DLL=%%~nxF"
+if "%CUDART_DLL%"=="" set "CUDART_DLL=cudart64_102.dll"
+
 echo === link ===
 link /nologo /SUBSYSTEM:CONSOLE,6.01 /OUT:hymt2_cli.exe ^
   build_msvc\hymt2_cli.obj build_msvc\model.obj build_msvc\kernels.obj ^
@@ -79,17 +84,18 @@ link /nologo /SUBSYSTEM:CONSOLE,6.01 /OUT:hymt2_cli.exe ^
   build_msvc\vulkan.obj build_msvc\device.obj build_msvc\cuda.obj ^
   build_msvc\npu.obj build_msvc\metal_stub.obj ^
   build_msvc\cuda_kernels.obj build_msvc\cuda_fused.obj ^
-  cudart.lib /LIBPATH:"%CUDA_LIB%"
+  cudart.lib delayimp.lib /DELAYLOAD:%CUDART_DLL% /LIBPATH:"%CUDA_LIB%"
 if errorlevel 1 goto fail
 
+copy /Y "%CUDA_BIN%%CUDART_DLL%" . >nul 2>nul
+
 echo.
-echo OK: %CD%\hymt2_cli.exe
-echo Copy this DLL next to the exe:
-echo   %CUDA_BIN%cudart64_102.dll
+echo OK: %CD%\hymt2_cli.exe  (CUDA+Vulkan+CPU; default HYMT2_DEVICE=auto)
+echo Ship %CUDART_DLL% next to the exe when testing CUDA.
+echo GPU driver provides vulkan-1.dll for Vulkan path.
 echo.
 echo Test:
-echo   set HYMT2_DEVICE=cuda
-echo   set HYMT2_FUSED=1
+echo   set HYMT2_DEVICE=auto
 echo   set HYMT2_VERBOSE=1
 echo   hymt2_cli.exe MODEL.gguf Chinese "Hi" 0 16
 pause

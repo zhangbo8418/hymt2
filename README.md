@@ -77,14 +77,17 @@ make bench           # 内核吞吐
 ./hymt2_cli model.gguf English "今天天气真好。" [threads] [max_tokens]   # 输出分阶段耗时
 ```
 
-**Windows 7 (CPU)**: 用 MinGW-w64 (**msvcrt** 运行时, 不要用 UCRT):  
+**Windows 7 (CPU-only)**: MinGW-w64 (**msvcrt**, 不要用 UCRT):  
 `make WIN7=1 CC=x86_64-w64-mingw32-gcc`。
 
-**Windows CUDA**: Windows 上的 `nvcc` **必须**搭配 MSVC (`cl.exe`)，MinGW 不能当 host compiler。  
-CUDA **10.2**（Win7 最后一版）官方支持的是 **VS 2015 / 2017 / 2019 (preview)**，不是「只能 VS 2017」。  
-推荐用 GitHub Actions 产物：workflow `windows-cuda` 会打出  
-- `hymt2-win7-cuda102`（CUDA 10.2，子系统 6.1，给 Win7 测）  
-- `hymt2-win10-cuda12`（CUDA 12，给 Win10+）
+**Windows 通用包 (推荐)**: 一份 `hymt2_cli.exe` 同时编入 **CPU + Vulkan + CUDA**。  
+默认 `HYMT2_DEVICE=auto`：加载时探测能力并校准，按 **cuda → vulkan → CPU** 选第一个比 CPU 快 ≥10% 的后端（无 fused 的 GPU 走逐算子 matmul，其余仍在 CPU，相当于混合）。  
+- Vulkan：运行时 `LoadLibrary(vulkan-1.dll)`，由显卡驱动提供，无 Vulkan 则跳过。  
+- CUDA：链入 fused 内核；`cudart` 为 delay-load，无 NVIDIA 运行库时仍可走 Vulkan/CPU。  
+Windows 上 `nvcc` 必须搭配 MSVC；CUDA 10.2（Win7 最后一版）支持 **VS 2015 / 2017 / 2019**。  
+GitHub Actions `windows-cuda` 产物：  
+- `hymt2-win7-universal`（CUDA 10.2 + Vulkan + CPU，子系统 6.1）  
+- `hymt2-win10-universal`（CUDA 12 + Vulkan + CPU）
 
 ## 测试 (均可在本目录运行)
 

@@ -1,5 +1,5 @@
-# Build Win64 hymt2 with CUDA fused on GitHub Actions.
-# Artifact targets Win7+ when built with CUDA 10.2 (subsystem 6.1).
+# Universal Win64: CUDA + Vulkan + CPU. Runtime HYMT2_DEVICE=auto picks fastest.
+# CUDA 10.2 artifact is Win7-compatible (subsystem 6.1). Vulkan via vulkan-1.dll at runtime.
 name: windows-cuda
 
 on:
@@ -13,13 +13,14 @@ on:
       - 'CMakeLists.txt'
       - '.github/workflows/windows-cuda.yml'
       - 'scripts/ci_build_win_cuda.bat'
+      - 'scripts/build_win_cuda_msvc.bat'
 
 permissions:
   contents: read
 
 jobs:
-  cuda102-win7:
-    name: CUDA 10.2 (Win7-compatible)
+  universal-win7:
+    name: Win7 universal (CUDA 10.2 + Vulkan + CPU)
     runs-on: windows-2019
     steps:
       - uses: actions/checkout@v4
@@ -45,14 +46,14 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hymt2-win7-cuda102
+          name: hymt2-win7-universal
           path: |
             hymt2_cli.exe
-            cudart64_102.dll
+            cudart64_*.dll
           if-no-files-found: error
 
-  cuda12-win10:
-    name: CUDA 12.x (Win10+)
+  universal-win10:
+    name: Win10+ universal (CUDA 12 + Vulkan + CPU)
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -76,7 +77,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hymt2-win10-cuda12
+          name: hymt2-win10-universal
           path: |
             hymt2_cli.exe
             cudart64_*.dll

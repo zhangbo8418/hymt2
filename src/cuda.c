@@ -150,6 +150,12 @@ static int cu_mm(cuweight *w, void *act, void *out, int nt) {
 
 hy_device *hy_cuda_create(const char *pref, char *info, size_t cap) {
     (void)pref;
+    /* 先探测运行库, 避免未装 CUDA / 无 cudart 时硬链或 delay-load 直接炸 */
+    char probe[8] = "0";
+    if (!hy_cuda_probe(probe, sizeof probe) || probe[0] != '1') {
+        if (info && cap) snprintf(info, cap, "无 CUDA 运行库 (cudart/nvcuda)");
+        return NULL;
+    }
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 1) {
         if (info && cap) snprintf(info, cap, "无 CUDA 设备");

@@ -24,7 +24,9 @@ nvcc --version
 
 if not exist build_msvc mkdir build_msvc
 
-set CFLAGS=/nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /DHYMT2_CUDA=1 /DHYMT2_NO_VULKAN /D_WIN32_WINNT=0x0601 /DWINVER=0x0601 /Ithird_party\vulkan /Isrc /Iinclude /I"%CUDA_INC%"
+rem Universal: CUDA + Vulkan + CPU. Vulkan is LoadLibrary(vulkan-1.dll) at runtime.
+rem CUDA uses delay-load so missing cudart still lets Vulkan/CPU run.
+set CFLAGS=/nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /DHYMT2_CUDA=1 /D_WIN32_WINNT=0x0601 /DWINVER=0x0601 /Ithird_party\vulkan /Isrc /Iinclude /I"%CUDA_INC%"
 
 echo === nvcc ===
 nvcc -O3 -c -Xcompiler "/MD /nologo" -o build_msvc\cuda_kernels.obj src\cuda_kernels.cu
@@ -56,11 +58,25 @@ if errorlevel 1 exit /b 1
 cl %CFLAGS% /c /Fobuild_msvc\metal_stub.obj src\metal_stub.c
 if errorlevel 1 exit /b 1
 
+echo === resolve cudart dll name for DELAYLOAD ===
+set "CUDART_DLL="
+for %%F in ("%CUDA_BIN%cudart64_*.dll") do set "CUDART_DLL=%%~nxF"
+if "%CUDART_DLL%"=="" (
+  echo ERROR: no cudart64_*.dll next to nvcc
+  exit /b 1
+)
+echo CUDART_DLL=%CUDART_DLL%
+
 echo === link ===
-link /nologo /SUBSYSTEM:CONSOLE,6.01 /OUT:hymt2_cli.exe build_msvc\hymt2_cli.obj build_msvc\model.obj build_msvc\kernels.obj build_msvc\gguf.obj build_msvc\tokenizer.obj build_msvc\threadpool.obj build_msvc\vulkan.obj build_msvc\device.obj build_msvc\cuda.obj build_msvc\npu.obj build_msvc\metal_stub.obj build_msvc\cuda_kernels.obj build_msvc\cuda_fused.obj cudart.lib /LIBPATH:"%CUDA_LIB%"
+link /nologo /SUBSYSTEM:CONSOLE,6.01 /OUT:hymt2_cli.exe ^
+  build_msvc\hymt2_cli.obj build_msvc\model.obj build_msvc\kernels.obj build_msvc\gguf.obj ^
+  build_msvc\tokenizer.obj build_msvc\threadpool.obj build_msvc\vulkan.obj build_msvc\device.obj ^
+  build_msvc\cuda.obj build_msvc\npu.obj build_msvc\metal_stub.obj ^
+  build_msvc\cuda_kernels.obj build_msvc\cuda_fused.obj ^
+  cudart.lib delayimp.lib /DELAYLOAD:%CUDART_DLL% /LIBPATH:"%CUDA_LIB%"
 if errorlevel 1 exit /b 1
 
-copy /Y "%CUDA_BIN%cudart64_*.dll" .
-dir /b hymt2_cli.exe cudart64_*.dll
-echo BUILD OK
+copy /Y "%CUDA_BIN%%CUDART_DLL%" .
+dir /b hymt2_cli.exe %CUDART_DLL%
+echo BUILD OK (CUDA+Vulkan+CPU universal; HYMT2_DEVICE=auto)
 endlocal

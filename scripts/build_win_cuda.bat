@@ -78,7 +78,9 @@ echo === compile cuda_fused.cu ===
 if errorlevel 1 goto nvcc_fail
 
 echo === mingw link may fail with MSVC .obj; prefer build_win_cuda_msvc.bat ===
-"%GCC%" -O3 -Wall -Wno-unused-parameter -fPIC -Ithird_party/vulkan -Isrc -Iinclude -Wno-missing-field-initializers -DHYMT2_CUDA=1 -DHYMT2_NO_VULKAN -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -o hymt2_cli.exe tools\hymt2_cli.c src\model.c src\kernels.c src\gguf.c src\tokenizer.c src\threadpool.c src\vulkan.c src\device.c src\cuda.c src\npu.c src\metal_stub.c src\cuda_kernels.obj src\cuda_fused.obj -lm -lcudart -static-libgcc -Wl,--major-os-version=6 -Wl,--minor-os-version=1 -Wl,--major-subsystem-version=6 -Wl,--minor-subsystem-version=1 -L"%CUDA_LIB%"
+rem Vulkan enabled (runtime LoadLibrary). Note: Windows nvcc still needs MSVC as host;
+rem this MinGW path is only for linking prebuilt .obj from nvcc/MSVC.
+"%GCC%" -O3 -Wall -Wno-unused-parameter -fPIC -Ithird_party/vulkan -Isrc -Iinclude -Wno-missing-field-initializers -DHYMT2_CUDA=1 -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -o hymt2_cli.exe tools\hymt2_cli.c src\model.c src\kernels.c src\gguf.c src\tokenizer.c src\threadpool.c src\vulkan.c src\device.c src\cuda.c src\npu.c src\metal_stub.c src\cuda_kernels.obj src\cuda_fused.obj -lm -lcudart -static-libgcc -Wl,--major-os-version=6 -Wl,--minor-os-version=1 -Wl,--major-subsystem-version=6 -Wl,--minor-subsystem-version=1 -L"%CUDA_LIB%"
 if errorlevel 1 goto link_fail
 
 echo.
