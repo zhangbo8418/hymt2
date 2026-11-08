@@ -157,11 +157,13 @@ static float *load_vec(hymt2_model *m, const char *name, int n) {
     return v;
 }
 
+static void forward_batch(hymt2_model *m, const int *toks, int nt, int pos0, bool want_logits);
+
+/* 默认物理核 (本机 4c 实测优于逻辑 8; 冷机可达 ~20 tok/s)。
+ * 加载时不做整网前向校准 (会把 CPU 烤热, 把第一次测速打成半速)。 */
 static int default_threads(void) {
     const char *e = getenv("HYMT2_THREADS");
     if (e && atoi(e) > 0) return atoi(e);
-    /* 默认绑定物理核 (不含超线程逻辑核); 争用同一执行单元时逻辑核并行常更慢。
-     * 可用 HYMT2_THREADS 覆盖。Android 额外封顶 4。 */
     int n = hy_physical_cpu_count();
     if (n < 1) n = 1;
 #if defined(__ANDROID__)
@@ -244,7 +246,8 @@ static bool calibrate_panel_wins(hymt2_model *m) {
 
 static bool repack_weights(hymt2_model *m) {
     const char *mode = getenv("HYMT2_REPACK");
-    const bool force_on = mode && !strcmp(mode, "1"), force_off = mode && !strcmp(mode, "0");
+    const bool force_on = mode && (!strcmp(mode, "1") || !strcmp(mode, "panel") || !strcmp(mode, "on"));
+    const bool force_off = mode && (!strcmp(mode, "0") || !strcmp(mode, "off") || !strcmp(mode, "native"));
     /* Q2_0C 的原生路径是标量参考实现, 必须重排; STQ1_0 按模式/实测决定 */
     bool want_stq = !force_off;
     if (want_stq && !force_on && m->n_layer > 0 && m->L[0].wg.type == GT_STQ1_0 && !calibrate_panel_wins(m)) return false;
@@ -265,7 +268,6 @@ static bool repack_weights(hymt2_model *m) {
 /* ------------------------------------------------------------------ 加速设备 (HYMT2_DEVICE, 兼容 HYMT2_VK) */
 
 static float *gpu_out(hymt2_model *m, const weight_t *w, float *host); /* 见 matmul 段 */
-static void forward_batch(hymt2_model *m, const int *toks, int nt, int pos0, bool want_logits);
 
 static void gpu_register(hymt2_model *m, weight_t *w, hy_dweight *g) {
     if (m->n_gpu == m->cap_gpu) {
@@ -320,10 +322,10 @@ static void fill_fused_shape(hymt2_model *m, hy_fused_args *sh, hy_fused_layer *
 
 /* CUDA/Metal: 只认整网 fused（权重/激活/KV 常驻, ≤1 sync）。
  * 旧改法「逐 matmul GPU + CPU 注意力」来回拷, 常慢于物理核 CPU, 且 fused 失败后仍留下 use_gpu=true。 */
-static bool enable_fused(hymt2_model *m, bool verbose) {
+static bool enable_fused(hymt2_model *m, bool verbose, bool force_ok_slower) {
     if (!m->dev || !hy_device_has_fused(m->dev) || !m->outw.gpu) return false;
     const char *fe = getenv("HYMT2_FUSED");
-    int force = fe && (!strcmp(fe, "1") || !strcmp(fe, "force") || !strcmp(fe, "yes") || !strcmp(fe, "on"));
+    int force = force_ok_slower || (fe && (!strcmp(fe, "1") || !strcmp(fe, "force") || !strcmp(fe, "yes") || !strcmp(fe, "on")));
     int forbid = fe && (!strcmp(fe, "0") || !strcmp(fe, "off") || !strcmp(fe, "no"));
     if (forbid) return false;
 
@@ -334,27 +336,40 @@ static bool enable_fused(hymt2_model *m, bool verbose) {
     if (!hy_device_fused_prepare(m->dev, &sh)) { free(fl); return false; }
 
     if (!force) {
+        /* 必须预热: 刚 upload 后 CPU 缓存冷启动会虚高 (实测 500ms+ vs 稳态 ~90ms),
+         * 曾导致 Iris Metal 误胜出而 decode 更慢。 */
         for (int i = 0; i < m->hidden; i++) m->h[i] = 0.01f * (float)((i * 17) % 100);
         hy_fused_args a = sh;
         a.nt = 1; a.pos0 = 0; a.want_logits = 1; a.h = m->h; a.logits = m->logits;
-        double t0 = now_ms();
-        for (int r = 0; r < 2; r++) {
+        for (int w = 0; w < 2; w++) {
             if (!hy_device_fused_forward(m->dev, &a)) { free(fl); return false; }
         }
-        double fused_ms = (now_ms() - t0) / 2.0;
+        double fused_best = 1e30;
+        for (int r = 0; r < 3; r++) {
+            double t0 = now_ms();
+            if (!hy_device_fused_forward(m->dev, &a)) { free(fl); return false; }
+            double dt = now_ms() - t0;
+            if (dt < fused_best) fused_best = dt;
+        }
         m->use_gpu = false;
         m->use_fused = false;
-        double t1 = now_ms();
-        int _tok1 = 1; forward_batch(m, &_tok1, 1, 0, true);
-        double cpu_ms = now_ms() - t1;
-        if (fused_ms > cpu_ms * 0.9) {
+        int _tok1 = 1;
+        for (int w = 0; w < 2; w++) forward_batch(m, &_tok1, 1, 0, true);
+        double cpu_best = 1e30;
+        for (int r = 0; r < 3; r++) {
+            double t1 = now_ms();
+            forward_batch(m, &_tok1, 1, 0, true);
+            double dt = now_ms() - t1;
+            if (dt < cpu_best) cpu_best = dt;
+        }
+        if (fused_best > cpu_best * 0.9) {
             fprintf(stderr, "[hymt2] fused 校准 %.1f ms/步 vs CPU %.1f ms — 不用 %s (HYMT2_FUSED=1 可强制)\n",
-                    fused_ms, cpu_ms, hy_device_name(m->dev));
+                    fused_best, cpu_best, hy_device_name(m->dev));
             free(fl);
             return false;
         }
         fprintf(stderr, "[hymt2] fused 校准 %.1f ms/步 vs CPU %.1f ms — 启用 %s\n",
-                fused_ms, cpu_ms, hy_device_name(m->dev));
+                fused_best, cpu_best, hy_device_name(m->dev));
     }
 
     free(m->fused_layers);
@@ -390,52 +405,18 @@ static bool device_upload_all(hymt2_model *m, bool verbose, bool forced) {
     return true;
 }
 
-/* Vulkan/NPU 等无 fused: 只校 FFN matmul; 必须明显快于 CPU 才启用逐算子路径。 */
-static double device_matmul_calibrate_ms(hymt2_model *m) {
-    const int ncal = m->n_layer < 4 ? m->n_layer : 4;
-    uint32_t s = 777;
-    for (int i = 0; i < m->hidden; i++) { s = s * 1664525u + 1013904223u; m->xn[i] = ((float)(s >> 9) / 4194304.f) - 1.f; }
-    for (int i = 0; i < m->ffn; i++) { s = s * 1664525u + 1013904223u; m->gate[i] = ((float)(s >> 9) / 4194304.f) - 1.f; }
-    quantize_rows(m->xn, 1, m->hidden, m->xq_h);
-    quantize_rows(m->gate, 1, m->ffn, m->xq_f);
+/* 无 fused 的后端: 必须用整步 forward 校准 (Iris Vulkan 仅 matmul「赢」但 decode 0.8 tok/s)。 */
+static double step_calibrate_ms(hymt2_model *m, bool use_gpu) {
+    m->use_gpu = use_gpu;
+    m->use_fused = false;
+    int tok = 1;
+    for (int w = 0; w < 2; w++) forward_batch(m, &tok, 1, 0, true);
     double best = 1e30;
-    for (int rep = 0; rep < 4; rep++) {
-        m->use_gpu = true;
-        m->use_fused = false;
-        double t1 = now_ms();
-        for (int l = 0; l < ncal; l++) {
-            const weight_t *gu[2] = { &m->L[l].wg, &m->L[l].wu };
-            float *os[2] = { gpu_out(m, &m->L[l].wg, m->gate), gpu_out(m, &m->L[l].wu, m->up) };
-            matmul_multi(m, gu, os, 2, m->xn, m->xq_h, 1);
-            matmul(m, &m->L[l].wd, m->xn, m->xq_f, 1, gpu_out(m, &m->L[l].wd, m->tmp));
-        }
-        double dt = (now_ms() - t1) / ncal;
-        if (!m->use_gpu) return 1e30;
-        if (rep > 0 && dt < best) best = dt;
-    }
-    return best;
-}
-
-static double cpu_calibrate_ms(hymt2_model *m) {
-    const int ncal = m->n_layer < 4 ? m->n_layer : 4;
-    uint32_t s = 777;
-    for (int i = 0; i < m->hidden; i++) { s = s * 1664525u + 1013904223u; m->xn[i] = ((float)(s >> 9) / 4194304.f) - 1.f; }
-    for (int i = 0; i < m->ffn; i++) { s = s * 1664525u + 1013904223u; m->gate[i] = ((float)(s >> 9) / 4194304.f) - 1.f; }
-    quantize_rows(m->xn, 1, m->hidden, m->xq_h);
-    quantize_rows(m->gate, 1, m->ffn, m->xq_f);
-    double best = 1e30;
-    for (int rep = 0; rep < 4; rep++) {
-        m->use_gpu = false;
-        m->use_fused = false;
-        double t1 = now_ms();
-        for (int l = 0; l < ncal; l++) {
-            const weight_t *gu[2] = { &m->L[l].wg, &m->L[l].wu };
-            float *os[2] = { m->gate, m->up };
-            matmul_multi(m, gu, os, 2, m->xn, m->xq_h, 1);
-            matmul(m, &m->L[l].wd, m->xn, m->xq_f, 1, m->tmp);
-        }
-        double dt = (now_ms() - t1) / ncal;
-        if (rep > 0 && dt < best) best = dt;
+    for (int r = 0; r < 3; r++) {
+        double t0 = now_ms();
+        forward_batch(m, &tok, 1, 0, true);
+        double dt = now_ms() - t0;
+        if (dt < best) best = dt;
     }
     return best;
 }
@@ -459,11 +440,11 @@ static void setup_device(hymt2_model *m) {
         fprintf(stderr, "[hymt2] 设备(强制): %s (%s)\n", hy_device_name(m->dev), info);
         if (!device_upload_all(m, verbose, true)) return;
         if (hy_device_has_fused(m->dev)) {
-            if (!enable_fused(m, verbose)) {
-                /* 强制设备但 fused 不够快: 仍开逐算子, 便于调试; 日志已提示 */
+            /* 强制设备: fused 即使慢于 CPU 也启用 — Iris 逐算子可再慢 5×+ */
+            if (!enable_fused(m, verbose, true)) {
                 m->use_gpu = true;
                 m->use_fused = false;
-                fprintf(stderr, "[hymt2] 强制 %s: fused 未胜出, 回退逐算子 (可能慢于 CPU)\n", hy_device_name(m->dev));
+                fprintf(stderr, "[hymt2] 强制 %s: fused 不可用, 只能逐算子\n", hy_device_name(m->dev));
             }
         } else {
             m->use_gpu = true;
@@ -473,7 +454,7 @@ static void setup_device(hymt2_model *m) {
     }
 
     static const char *cands[] = { "cuda", "metal", "vulkan", "qnn", "nnapi", "rkllm", "hiai", NULL };
-    double cpu_ms = cpu_calibrate_ms(m);
+    double cpu_ms = step_calibrate_ms(m, false);
     for (int i = 0; cands[i]; i++) {
         char info[256] = "";
         hy_device *d = hy_device_try(cands[i], info, sizeof info);
@@ -481,12 +462,26 @@ static void setup_device(hymt2_model *m) {
             if (verbose) fprintf(stderr, "[hymt2] auto skip %s: %s\n", cands[i], info);
             continue;
         }
+        /* Iris/UHD 等入门核显: 实测整网远慢于 AVX2, 全量上传+校准只会拖垮加载与缓存 */
+        {
+            const char *nm = hy_device_name(d);
+            const char *blob = info[0] ? info : (nm ? nm : "");
+            int igpu = strstr(blob, "integrated") || strstr(blob, "Iris") ||
+                       strstr(blob, "UHD Graphics") || strstr(blob, "HD Graphics") ||
+                       strstr(blob, "Graphics 655");
+            if (igpu) {
+                fprintf(stderr, "[hymt2] auto skip %s (%s): 入门核显不抢 CPU\n",
+                        nm ? nm : cands[i], info[0] ? info : "?");
+                hy_device_destroy(d);
+                continue;
+            }
+        }
         if (m->dev) gpu_drop(m);
         m->dev = d;
         if (!device_upload_all(m, verbose, false)) continue;
 
         if (hy_device_has_fused(m->dev)) {
-            if (enable_fused(m, verbose)) {
+            if (enable_fused(m, verbose, false)) {
                 fprintf(stderr, "[hymt2] auto -> %s+fused (%s)\n", hy_device_name(d), info);
                 return;
             }
@@ -495,19 +490,18 @@ static void setup_device(hymt2_model *m) {
             continue;
         }
 
-        double ms = device_matmul_calibrate_ms(m);
-        fprintf(stderr, "[hymt2] 校准 %s matmul: %.2f ms/层 (CPU %.2f)\n", hy_device_name(d), ms, cpu_ms);
-        if (ms < cpu_ms * 0.9) {
-            m->use_gpu = true;
+        double ms = step_calibrate_ms(m, true);
+        fprintf(stderr, "[hymt2] 校准 %s 整步: %.1f ms vs CPU %.1f ms\n", hy_device_name(d), ms, cpu_ms);
+        if (m->use_gpu && ms < cpu_ms * 0.9) {
             m->use_fused = false;
-            fprintf(stderr, "[hymt2] auto -> %s (matmul %.2f < CPU %.2f×0.9; %s)\n",
+            fprintf(stderr, "[hymt2] auto -> %s (整步 %.1f < CPU %.1f×0.9; %s)\n",
                     hy_device_name(d), ms, cpu_ms, info);
             return;
         }
         fprintf(stderr, "[hymt2] %s 未优于 CPU, 继续\n", hy_device_name(d));
         gpu_drop(m);
     }
-    fprintf(stderr, "[hymt2] auto -> cpu (无设备快过物理核 CPU 10%%; CPU %.2f ms/层)\n", cpu_ms);
+    fprintf(stderr, "[hymt2] auto -> cpu (无设备快过物理核 CPU 10%%; CPU %.1f ms/步)\n", cpu_ms);
 }
 
 hymt2_model *hymt2_model_load(const char *path, int n_threads, int ctx_len, char *err, int err_cap) {
@@ -618,12 +612,12 @@ hymt2_model *hymt2_model_load(const char *path, int n_threads, int ctx_len, char
         set_err(m, "out of memory (%s)", "scratch");
         FAIL();
     }
-    m->tp = tp_create(n_threads > 0 ? n_threads : default_threads());
     /* prefill 的 token 分块大小: 没有 AVX 的小核心 (L1 只有 24KB) 用 8, 其余 16; HYMT2_BATCH 可覆盖 */
     m->batch = (!strcmp(kernels_isa(), "ssse3") || !strcmp(kernels_isa(), "sse4.1") || !strcmp(kernels_isa(), "scalar")) ? 8 : MAX_BATCH;
     if (getenv("HYMT2_BATCH") && atoi(getenv("HYMT2_BATCH")) >= 1) m->batch = atoi(getenv("HYMT2_BATCH"));
     if (m->batch > MAX_BATCH) m->batch = MAX_BATCH;
     m->err[0] = 0;
+    m->tp = tp_create(n_threads > 0 ? n_threads : default_threads());
     if (!repack_weights(m)) { snprintf(m->err, sizeof m->err, "%s", "out of memory while repacking weights"); FAIL(); }
     setup_device(m);
     if (getenv("HYMT2_VERBOSE"))

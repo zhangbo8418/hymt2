@@ -415,18 +415,21 @@ static bool mt_fused_forward(void *impl, hy_fused_args *a) {
             {
                 struct { uint32_t heads, hdim, nhalf, pos0, nt, pad0; } rpc =
                     { (uint32_t)a->heads, (uint32_t)a->hdim, (uint32_t)a->rope_half, (uint32_t)a->pos0, (uint32_t)a->nt, 0 };
+                /* 旧: nhalf×heads×nt 个 TG、每 TG 1 线程 → Iris 上调度开销爆炸 */
+                NSUInteger nh = (NSUInteger)a->rope_half;
+                NSUInteger tgx = nh < 64 ? nh : 64;
                 [enc setComputePipelineState:c->pipe[P_ROPE]];
                 [enc setBuffer:c->buf_q offset:0 atIndex:0];
                 [enc setBuffer:c->buf_rope_c offset:0 atIndex:1];
                 [enc setBuffer:c->buf_rope_s offset:0 atIndex:2];
                 [enc setBytes:&rpc length:sizeof(rpc) atIndex:3];
-                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)a->rope_half, (NSUInteger)a->heads, (NSUInteger)a->nt)
-                    threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                [enc dispatchThreadgroups:MTLSizeMake((nh + tgx - 1) / tgx, (NSUInteger)a->heads, (NSUInteger)a->nt)
+                    threadsPerThreadgroup:MTLSizeMake(tgx, 1, 1)];
                 rpc.heads = (uint32_t)a->kv_heads;
                 [enc setBuffer:c->buf_k offset:0 atIndex:0];
                 [enc setBytes:&rpc length:sizeof(rpc) atIndex:3];
-                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)a->rope_half, (NSUInteger)a->kv_heads, (NSUInteger)a->nt)
-                    threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                [enc dispatchThreadgroups:MTLSizeMake((nh + tgx - 1) / tgx, (NSUInteger)a->kv_heads, (NSUInteger)a->nt)
+                    threadsPerThreadgroup:MTLSizeMake(tgx, 1, 1)];
             }
             /* q: nt*heads 行, stride=hdim; k: nt*kv_heads 行 */
             mt_enc_rms_rows(c, enc, c->buf_q, c->norm_q[li], (uint32_t)a->hdim,
@@ -547,9 +550,10 @@ static bool mt_fused_forward(void *impl, hy_fused_args *a) {
         [cb commit];
         [cb waitUntilCompleted]; /* 整网一次 GPU 同步 */
         if (cb.error) { c->broken = true; return false; }
-        memcpy(a->h, c->buf_h.contents, hbytes);
+        /* 下一步会重新 embed 覆盖 h, 无需整缓冲 D2H; 只要 logits */
         if (a->want_logits && a->outw && a->logits)
             memcpy(a->logits, ((mtweight *)a->outw)->op, sizeof(float) * (size_t)((mtweight *)a->outw)->n);
+        (void)hbytes;
         return true;
     }
 }

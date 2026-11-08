@@ -304,6 +304,7 @@ static void stq_rows_sse41(const weight_t *w, int r0, int r1, const q8k_block *x
     const __m128i ones = _mm_set1_epi16(1);
     for (int r = r0; r < r1; r++) {
         const block_stq1_0 *row = (const block_stq1_0 *)(w->data + (size_t)r * w->row_bytes);
+        if (r + 1 < r1) _mm_prefetch((const char *)(row + nb), _MM_HINT_T0);
         __m128 accf[MAX_BATCH];
         for (int t = 0; t < nt; t++) accf[t] = _mm_setzero_ps();
         for (int b = 0; b < nb; b++) {
@@ -574,20 +575,22 @@ static void panel_rows_scalar(const weight_t *w, int r0, int r1, const q8k_block
 }
 
 #ifdef HY_X86
-/* SSE (ssse3 起, SSE4.1/4.2 机器同样用它): 内层循环只剩 and / shift / maddubs / add */
+/* SSE (ssse3 起, SSE4.1/4.2 / J4125 走它): maddubs 内核; 加大预取盖住弱乱序/低带宽 */
 HY_TARGET("ssse3")
 static void panel_rows_ssse3(const weight_t *w, int r0, int r1, const q8k_block *xq, int nt, float *out) {
     const int nb = w->k / QK_K;
-    const int pfr = (int)(HY_PF_BYTES / ((size_t)nb * 64)) < 1 ? 1 : (int)(HY_PF_BYTES / ((size_t)nb * 64));
+    const int pfr = (int)((size_t)HY_PF_BYTES * 2 / ((size_t)nb * 64)) < 1 ? 1 : (int)((size_t)HY_PF_BYTES * 2 / ((size_t)nb * 64));
     const __m128i m3 = _mm_set1_epi8(3), ones = _mm_set1_epi16(1), vshift = _mm_cvtsi32_si128(w->pshift);
     const int off = w->poff;
     for (int r = r0; r < r1; r++) {
         const uint8_t *pk = w->pk + (size_t)r * nb * 64;
         const float *ps = w->ps + (size_t)r * nb;
-        if (r + pfr < r1) { /* 预取前方若干行的权重 (低带宽 CPU 上有助于隐藏访存延迟) */
+        if (r + pfr < r1) {
             const char *nx = (const char *)(pk + (size_t)nb * 64 * pfr);
             for (int b = 0; b < nb; b++) _mm_prefetch(nx + b * 64, _MM_HINT_T0);
         }
+        /* 同时预取下一行首块, 利于 J4125 一类小 L2 */
+        if (r + 1 < r1) _mm_prefetch((const char *)(pk + (size_t)nb * 64), _MM_HINT_T0);
         __m128 accf[MAX_BATCH];
         for (int t = 0; t < nt; t++) accf[t] = _mm_setzero_ps();
         for (int b = 0; b < nb; b++) {
@@ -606,7 +609,7 @@ static void panel_rows_ssse3(const weight_t *w, int r0, int r1, const q8k_block 
                 s32 = _mm_sub_epi32(s32, _mm_cvtsi32_si128(off * y->sum));
                 accf[0] = _mm_add_ps(accf[0], _mm_mul_ps(_mm_cvtepi32_ps(s32), _mm_set1_ps(sc * y->d)));
             } else {
-                __m128i p[4][4]; /* [j][l] */
+                __m128i p[4][4];
                 for (int j = 0; j < 4; j++) {
                     __m128i v = _mm_load_si128((const __m128i *)(pk + b * 64 + j * 16));
                     p[j][0] = _mm_and_si128(v, m3);

@@ -82,11 +82,19 @@ static: hymt2_cli_static
 hymt2_cli_static: tools/hymt2_cli.c $(filter-out src/capi.c,$(CSRC)) $(OBJC_SRC) include/hymt2.h
 	$(CC) $(CFLAGS) -DHYMT2_NO_VULKAN -static -o $@ tools/hymt2_cli.c $(filter-out src/capi.c,$(CSRC)) $(OBJC_SRC) -lm -lpthread
 
-libhymt2.$(EXT): $(CSRC) $(OBJC_SRC) $(CUDA_OBJ) src/internal.h include/hymt2.h src/unicode_tables.h src/device.h src/metal_shaders.h src/metal_fused_shaders.h
-	$(CC) $(CFLAGS) $(SHARED) -o $@ $(CSRC) $(OBJC_SRC) $(CUDA_OBJ) $(LIBS) $(LDWIN7) $(if $(OBJC_SRC),-fobjc-arc)
+# Metal .m 单独编, 切勿把 -fobjc-arc 打到 model.c/kernels.c 上 (实测会拖慢 CPU decode)
+METAL_OBJ =
+ifneq ($(OBJC_SRC),)
+METAL_OBJ = src/metal.o
+src/metal.o: src/metal.m src/metal_shaders.h src/metal_fused_shaders.h src/device.h src/internal.h
+	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ src/metal.m
+endif
 
-hymt2_cli$(EXE): tools/hymt2_cli.c $(filter-out src/capi.c,$(CSRC)) $(OBJC_SRC) $(CUDA_OBJ) include/hymt2.h src/metal_shaders.h src/metal_fused_shaders.h
-	$(CC) $(CFLAGS) -o $@ tools/hymt2_cli.c $(filter-out src/capi.c,$(CSRC)) $(OBJC_SRC) $(CUDA_OBJ) $(LIBS) $(LDWIN7) $(if $(OBJC_SRC),-fobjc-arc)
+libhymt2.$(EXT): $(CSRC) $(METAL_OBJ) $(CUDA_OBJ) src/internal.h include/hymt2.h src/unicode_tables.h src/device.h
+	$(CC) $(CFLAGS) $(SHARED) -o $@ $(CSRC) $(METAL_OBJ) $(CUDA_OBJ) $(LIBS) $(LDWIN7)
+
+hymt2_cli$(EXE): tools/hymt2_cli.c $(filter-out src/capi.c,$(CSRC)) $(METAL_OBJ) $(CUDA_OBJ) include/hymt2.h
+	$(CC) $(CFLAGS) -o $@ tools/hymt2_cli.c $(filter-out src/capi.c,$(CSRC)) $(METAL_OBJ) $(CUDA_OBJ) $(LIBS) $(LDWIN7)
 
 test_kernels$(EXE): tests/test_kernels.c src/kernels.c src/internal.h
 	$(CC) $(CFLAGS) -Wno-misleading-indentation -o $@ tests/test_kernels.c src/kernels.c -lm
@@ -105,6 +113,6 @@ src/unicode_tables.h: tools/gen_unicode.py
 
 clean:
 	rm -f libhymt2.so libhymt2.dylib libhymt2.dll hymt2_cli hymt2_cli.exe hymt2_cli_static \
-	      test_kernels test_kernels.exe bench_kernels bench_kernels.exe src/cuda_kernels.o src/cuda_fused.o
+	      test_kernels test_kernels.exe bench_kernels bench_kernels.exe src/cuda_kernels.o src/cuda_fused.o src/metal.o
 
 .PHONY: all static test bench clean
