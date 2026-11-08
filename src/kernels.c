@@ -8,6 +8,38 @@
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
 #define HY_X86 1
 #include <immintrin.h>
+#if defined(__GNUC__) || defined(__clang__)
+#define HY_TARGET(...) __attribute__((target(__VA_ARGS__)))
+#define HY_CPU_INIT() __builtin_cpu_init()
+#define HY_CPU_SUPPORTS(feat) __builtin_cpu_supports(feat)
+#else
+/* MSVC: no function multiversion; CPUID dispatch picks compiled intrinsic paths. */
+#define HY_TARGET(...)
+#include <intrin.h>
+static int hy_cpu_bit(int leaf, int sub, int reg, int bit) {
+    int info[4] = {0, 0, 0, 0};
+    __cpuidex(info, leaf, sub);
+    return (info[reg] >> bit) & 1;
+}
+static void hy_cpu_init_msvc(void) { (void)0; }
+static int hy_cpu_supports_msvc(const char *feat) {
+    if (!strcmp(feat, "ssse3")) return hy_cpu_bit(1, 0, 2, 9);
+    if (!strcmp(feat, "sse4.1")) return hy_cpu_bit(1, 0, 2, 19);
+    if (!strcmp(feat, "sse4.2")) return hy_cpu_bit(1, 0, 2, 20);
+    if (!strcmp(feat, "avx")) return hy_cpu_bit(1, 0, 2, 28);
+    if (!strcmp(feat, "fma")) return hy_cpu_bit(1, 0, 2, 12);
+    if (!strcmp(feat, "f16c")) return hy_cpu_bit(1, 0, 2, 29);
+    if (!strcmp(feat, "avx2")) return hy_cpu_bit(7, 0, 1, 5);
+    if (!strcmp(feat, "avx512f")) return hy_cpu_bit(7, 0, 1, 16);
+    if (!strcmp(feat, "avx512dq")) return hy_cpu_bit(7, 0, 1, 17);
+    if (!strcmp(feat, "avx512bw")) return hy_cpu_bit(7, 0, 1, 30);
+    if (!strcmp(feat, "avx512vl")) return hy_cpu_bit(7, 0, 1, 31);
+    if (!strcmp(feat, "avx512vnni")) return hy_cpu_bit(7, 0, 2, 11); /* ECX bit 11 */
+    return 0;
+}
+#define HY_CPU_INIT() hy_cpu_init_msvc()
+#define HY_CPU_SUPPORTS(feat) hy_cpu_supports_msvc(feat)
+#endif
 #endif
 #if defined(__aarch64__)
 #define HY_NEON 1
@@ -30,6 +62,13 @@
 #endif
 
 #include <stdlib.h>
+#if defined(__GNUC__) || defined(__clang__)
+#define HY_PREFETCH(addr) __builtin_prefetch((addr), 0, 3)
+#elif defined(HY_X86)
+#define HY_PREFETCH(addr) _mm_prefetch((const char *)(addr), _MM_HINT_T2)
+#else
+#define HY_PREFETCH(addr) ((void)0)
+#endif
 #ifdef _WIN32
 #include <malloc.h>
 void *hy_aligned_alloc(size_t size) { return _aligned_malloc(size, 64); }
@@ -179,7 +218,7 @@ void quantize_q8k(const float *x, int k, q8k_block *y) {
 }
 
 #ifdef HY_X86
-__attribute__((target("f16c")))
+HY_TARGET("f16c")
 static inline float f16_hw(uint16_t h) { return _cvtsh_ss(h); }
 #endif
 #ifdef HY_NEON
@@ -241,7 +280,7 @@ static void stq_rows_scalar(const weight_t *w, int r0, int r1, const q8k_block *
 
 #ifdef HY_X86
 /* 解出一个 64 权重 chunk (16 组) 的 4 个 lane 平面, 每个字节是 0/1/2 (= 权重+1) */
-__attribute__((target("ssse3")))
+HY_TARGET("ssse3")
 static inline void stq_chunk_codes_ssse3(const uint8_t *qs, const uint8_t *sg, __m128i out[4], __m128i tlo, __m128i thi) {
     const __m128i m0f = _mm_set1_epi8(0x0F), m3 = _mm_set1_epi8(3);
     __m128i qb = _mm_loadl_epi64((const __m128i *)qs);
@@ -258,7 +297,7 @@ static inline void stq_chunk_codes_ssse3(const uint8_t *qs, const uint8_t *sg, _
     out[3] = _mm_and_si128(_mm_srli_epi16(qp, 6), m3);
 }
 
-__attribute__((target("ssse3")))
+HY_TARGET("ssse3")
 static void stq_rows_ssse3(const weight_t *w, int r0, int r1, const q8k_block *xq, int nt, float *out) {
     /* 面向没有 AVX 的 CPU (如 J4125 / Goldmont Plus): 尽量少的指令。
      *  - maddubs 的 int16 结果在一个权重块内直接累加 (每通道最多 16×508 = 8128, 不会溢出), 只在块末做一次 madd
@@ -298,7 +337,7 @@ static void stq_rows_ssse3(const weight_t *w, int r0, int r1, const q8k_block *x
     }
 }
 
-__attribute__((target("sse4.1")))
+HY_TARGET("sse4.1")
 static inline void stq_chunk_codes_sse41(const uint8_t *qs, const uint8_t *sg, __m128i out[4], __m128i tlo, __m128i thi) {
     const __m128i m0f = _mm_set1_epi8(0x0F), m3 = _mm_set1_epi8(3);
     __m128i qb = _mm_loadl_epi64((const __m128i *)qs);
@@ -313,7 +352,7 @@ static inline void stq_chunk_codes_sse41(const uint8_t *qs, const uint8_t *sg, _
     out[3] = _mm_and_si128(_mm_srli_epi16(qp, 6), m3);
 }
 
-__attribute__((target("sse4.1")))
+HY_TARGET("sse4.1")
 static void stq_rows_sse41(const weight_t *w, int r0, int r1, const q8k_block *xq, int nt, float *out) {
     /* SSE4.1 版 (J4125 / Goldmont Plus 走这条): 同 ssse3 版, 另用 pblendvb 把符号选择从 3 条指令降到 1 条。
      *  - maddubs 的 int16 结果在一个权重块内直接累加 (每通道最多 16×508 = 8128, 不会溢出), 只在块末做一次 madd
@@ -413,13 +452,13 @@ static void stq_rows_neon_dotprod(const weight_t *w, int r0, int r1, const q8k_b
 
 #ifdef HY_X86
 /* 从 chunk c 的两个符号字节展开出 16 字节的 0x00/0xFF 掩码 */
-__attribute__((target("avx2,f16c")))
+HY_TARGET("avx2,f16c")
 static inline __m128i stq_sign_mask128(const uint8_t *sg, int c) {
     return _mm_set_epi64x((long long)SIGN_LUT[sg[2 * c + 1]], (long long)SIGN_LUT[sg[2 * c]]);
 }
 
 /* 解出一个权重块: A=[chunk0|chunk2], B=[chunk1|chunk3] 两个 256-bit 的 qpack 字节 */
-__attribute__((target("avx2,f16c")))
+HY_TARGET("avx2,f16c")
 static inline void stq_block_qpack_avx2(const block_stq1_0 *x, __m256i *outA, __m256i *outB, __m256i tlo, __m256i thi) {
     const __m256i m0f = _mm256_set1_epi8(0x0F);
     __m256i qb = _mm256_loadu_si256((const __m256i *)x->qs);
@@ -434,7 +473,7 @@ static inline void stq_block_qpack_avx2(const block_stq1_0 *x, __m256i *outA, __
     *outB = _mm256_or_si256(_mm256_andnot_si256(mB, b0), _mm256_and_si256(mB, b1));
 }
 
-__attribute__((target("avx2,f16c")))
+HY_TARGET("avx2,f16c")
 static void stq_rows_avx2(const weight_t *w, int r0, int r1, const q8k_block *xq, int nt, float *out) {
     const int nb = w->k / QK_K;
     const __m256i tlo = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)STQ_CODEBOOK));
@@ -513,7 +552,7 @@ static void stq_rows_avx2(const weight_t *w, int r0, int r1, const q8k_block *xq
         for (int t = 0; t < nt; t++) out[(size_t)t * w->n + r] = _mm512_reduce_add_ps(accf[t]);                         \
     }
 
-__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx2,f16c")))
+HY_TARGET("avx512f,avx512bw,avx512vl,avx512dq,avx2,f16c")
 static void stq_rows_avx512(const weight_t *w, int r0, int r1, const q8k_block *xq, int nt, float *out) {
     STQ_AVX512_BODY(
         __m512i s16 = _mm512_add_epi16(_mm512_add_epi16(_mm512_maddubs_epi16(p0, a0), _mm512_maddubs_epi16(p1, a1)),
@@ -522,7 +561,7 @@ static void stq_rows_avx512(const weight_t *w, int r0, int r1, const q8k_block *
     )
 }
 
-__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vnni,avx2,f16c")))
+HY_TARGET("avx512f,avx512bw,avx512vl,avx512dq,avx512vnni,avx2,f16c")
 static void stq_rows_avx512_vnni(const weight_t *w, int r0, int r1, const q8k_block *xq, int nt, float *out) {
     STQ_AVX512_BODY(
         s32 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), p0, a0);
@@ -602,7 +641,7 @@ static void panel_rows_scalar(const weight_t *w, int r0, int r1, const q8k_block
 
 #ifdef HY_X86
 /* SSE (ssse3 起, SSE4.1/4.2 机器同样用它): 内层循环只剩 and / shift / maddubs / add */
-__attribute__((target("ssse3")))
+HY_TARGET("ssse3")
 static void panel_rows_ssse3(const weight_t *w, int r0, int r1, const q8k_block *xq, int nt, float *out) {
     const int nb = w->k / QK_K;
     const int pfr = (int)(HY_PF_BYTES / ((size_t)nb * 64)) < 1 ? 1 : (int)(HY_PF_BYTES / ((size_t)nb * 64));
@@ -661,7 +700,7 @@ static void panel_rows_ssse3(const weight_t *w, int r0, int r1, const q8k_block 
     }
 }
 
-__attribute__((target("avx2")))
+HY_TARGET("avx2")
 static void panel_rows_avx2(const weight_t *w, int r0, int r1, const q8k_block *xq, int nt, float *out) {
     const int nb = w->k / QK_K;
     const int pfr = (int)(HY_PF_BYTES / ((size_t)nb * 64)) < 1 ? 1 : (int)(HY_PF_BYTES / ((size_t)nb * 64));
@@ -745,7 +784,7 @@ static void panel_rows_avx2(const weight_t *w, int r0, int r1, const q8k_block *
         for (int t = 0; t < nt; t++) out[(size_t)t * w->n + r] = _mm512_reduce_add_ps(accf[t]);                         \
     }
 
-__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx2")))
+HY_TARGET("avx512f,avx512bw,avx512vl,avx512dq,avx2")
 static void panel_rows_avx512(const weight_t *w, int r0, int r1, const q8k_block *xq, int nt, float *out) {
     PANEL_AVX512_BODY(
         __m512i s16 = _mm512_add_epi16(_mm512_add_epi16(_mm512_maddubs_epi16(p0, a0), _mm512_maddubs_epi16(p1, a1)),
@@ -754,7 +793,7 @@ static void panel_rows_avx512(const weight_t *w, int r0, int r1, const q8k_block
     )
 }
 
-__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vnni,avx2")))
+HY_TARGET("avx512f,avx512bw,avx512vl,avx512dq,avx512vnni,avx2")
 static void panel_rows_avx512_vnni(const weight_t *w, int r0, int r1, const q8k_block *xq, int nt, float *out) {
     PANEL_AVX512_BODY(
         s32 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), p0, a0);
@@ -780,8 +819,8 @@ static void panel_rows_avx512_vnni(const weight_t *w, int r0, int r1, const q8k_
         if (r + pref < r1) {                                                                                           \
             const uint8_t *nx = pk + (size_t)nb * 64 * (size_t)pref;                                                    \
             for (int b = 0; b < nb; b += 4) {                                                                           \
-                __builtin_prefetch(nx + (size_t)b * 64, 0, 3);                                                         \
-                if (b + 2 < nb) __builtin_prefetch(nx + (size_t)(b + 2) * 64, 0, 3);                                   \
+                HY_PREFETCH(nx + (size_t)b * 64);                                                         \
+                if (b + 2 < nb) HY_PREFETCH(nx + (size_t)(b + 2) * 64);                                   \
             }                                                                                                          \
         }                                                                                                              \
         float acc[MAX_BATCH];                                                                                          \
@@ -969,7 +1008,7 @@ typedef float (*kq_dot_fn4)(const block_q4_k *, const q8k_block *, int);
 static kq_dot_fn4 g_q4k_dot = q4_k_dot_scalar;
 
 #ifdef HY_X86
-__attribute__((target("ssse3")))
+HY_TARGET("ssse3")
 static inline int hsum_epi32_ssse3(__m128i v) {
     v = _mm_hadd_epi32(v, v);
     v = _mm_hadd_epi32(v, v);
@@ -977,7 +1016,7 @@ static inline int hsum_epi32_ssse3(__m128i v) {
 }
 
 /* SSSE3: 每个 32 元素子块 = 两个 16 字节向量的 maddubs, 之后乘子块缩放 */
-__attribute__((target("ssse3")))
+HY_TARGET("ssse3")
 static float q4_k_dot_ssse3(const block_q4_k *x, const q8k_block *y, int nb) {
     const __m128i m0f = _mm_set1_epi8(0x0F);
     float sumf = 0.f;
@@ -1002,7 +1041,7 @@ static float q4_k_dot_ssse3(const block_q4_k *x, const q8k_block *y, int nb) {
     return sumf;
 }
 
-__attribute__((target("avx2,f16c")))
+HY_TARGET("avx2,f16c")
 static inline int hsum_epi32_avx2(__m256i v) {
     __m128i r = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
     r = _mm_hadd_epi32(r, r);
@@ -1010,7 +1049,7 @@ static inline int hsum_epi32_avx2(__m256i v) {
     return _mm_cvtsi128_si32(r);
 }
 
-__attribute__((target("avx2,f16c")))
+HY_TARGET("avx2,f16c")
 static float q4_k_dot_avx2(const block_q4_k *x, const q8k_block *y, int nb) {
     const __m256i m0f = _mm256_set1_epi8(0x0F);
     float sumf = 0.f;
@@ -1080,7 +1119,7 @@ static q6_dot_fn g_q6_dot = q6_k_dot_scalar;
 
 #ifdef HY_X86
 /* 思路同 llama.cpp: 用无符号 6-bit 值做 maddubs, 再减去 32 * Σ(scale_j * bsum_j) */
-__attribute__((target("ssse3")))
+HY_TARGET("ssse3")
 static float q6_k_dot_ssse3(const block_q6_k *x, const q8k_block *y, int nb) {
     const __m128i m0f = _mm_set1_epi8(0x0F), m30 = _mm_set1_epi8(0x30), zero = _mm_setzero_si128();
     float sumf = 0.f;
@@ -1114,7 +1153,7 @@ static float q6_k_dot_ssse3(const block_q6_k *x, const q8k_block *y, int nb) {
     return sumf;
 }
 
-__attribute__((target("sse4.1")))
+HY_TARGET("sse4.1")
 static float q6_k_dot_sse41(const block_q6_k *x, const q8k_block *y, int nb) {
     const __m128i m0f = _mm_set1_epi8(0x0F), m30 = _mm_set1_epi8(0x30), zero = _mm_setzero_si128();
     float sumf = 0.f;
@@ -1152,7 +1191,7 @@ static float q6_k_dot_sse41(const block_q6_k *x, const q8k_block *y, int nb) {
     return sumf;
 }
 
-__attribute__((target("avx2,f16c")))
+HY_TARGET("avx2,f16c")
 static float q6_k_dot_avx2(const block_q6_k *x, const q8k_block *y, int nb) {
     const __m256i m0f = _mm256_set1_epi8(0x0F), m30 = _mm256_set1_epi8(0x30);
     __m256 accf = _mm256_setzero_ps();
@@ -1241,7 +1280,7 @@ static q8_dot_fn g_q8_dot = dot_q8_0_f32;
 
 #ifdef HY_X86
 /* SSE4.1: pmovsxbd 扩展 int8→int32 再转 float 点积 */
-__attribute__((target("sse4.1")))
+HY_TARGET("sse4.1")
 static float dot_q8_0_sse41(const block_q8_0 *x, const float *y, int k) {
     float sum = 0.f;
     for (int b = 0; b < k / 32; b++) {
@@ -1258,7 +1297,7 @@ static float dot_q8_0_sse41(const block_q8_0 *x, const float *y, int k) {
     return sum;
 }
 
-__attribute__((target("avx2,f16c")))
+HY_TARGET("avx2,f16c")
 static float dot_q8_0_avx2(const block_q8_0 *x, const float *y, int k) {
     float sum = 0.f;
     for (int b = 0; b < k / 32; b++) {
@@ -1314,7 +1353,7 @@ static void axpy_bf16_scalar(float *o, const uint16_t *v, float p, int n) {
 }
 
 #ifdef HY_X86
-__attribute__((target("avx2")))
+HY_TARGET("avx2")
 static float dot_bf16_avx2(const float *q, const uint16_t *k, int n) {
     __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
     int d = 0;
@@ -1331,7 +1370,7 @@ static float dot_bf16_avx2(const float *q, const uint16_t *k, int n) {
     for (; d < n; d++) s += q[d] * bf16_to_f32(k[d]);
     return s;
 }
-__attribute__((target("avx2")))
+HY_TARGET("avx2")
 static void axpy_bf16_avx2(float *o, const uint16_t *v, float p, int n) {
     __m256 pv = _mm256_set1_ps(p);
     int d = 0;
@@ -1573,27 +1612,27 @@ bool kernels_set_isa(const char *name) {
         if (max_level < 0) return false;
     }
 #ifdef HY_X86
-    __builtin_cpu_init();
-    if (max_level >= 1 && __builtin_cpu_supports("ssse3")) {
+    HY_CPU_INIT();
+    if (max_level >= 1 && HY_CPU_SUPPORTS("ssse3")) {
         g_stq_rows = stq_rows_ssse3; g_q6_dot = q6_k_dot_ssse3; g_isa = "ssse3"; g_level = 1;
         g_dot_bf16 = dot_bf16_sse2; g_axpy_bf16 = axpy_bf16_sse2; g_panel_rows = panel_rows_ssse3;
         g_q4k_dot = q4_k_dot_ssse3;
     }
-    if (max_level >= 2 && __builtin_cpu_supports("sse4.1")) {
+    if (max_level >= 2 && HY_CPU_SUPPORTS("sse4.1")) {
         g_stq_rows = stq_rows_sse41; g_q6_dot = q6_k_dot_sse41; g_isa = "sse4.1"; g_level = 2;
         g_dot_bf16 = dot_bf16_sse2; g_axpy_bf16 = axpy_bf16_sse2;
         g_q8_dot = dot_q8_0_sse41;
     }
-    if (max_level >= 3 && __builtin_cpu_supports("avx2") && __builtin_cpu_supports("f16c")) {
+    if (max_level >= 3 && HY_CPU_SUPPORTS("avx2") && HY_CPU_SUPPORTS("f16c")) {
         g_stq_rows = stq_rows_avx2; g_q6_dot = q6_k_dot_avx2; g_isa = "avx2"; g_level = 3;
         g_dot_bf16 = dot_bf16_avx2; g_axpy_bf16 = axpy_bf16_avx2; g_panel_rows = panel_rows_avx2;
         g_q4k_dot = q4_k_dot_avx2; g_q8_dot = dot_q8_0_avx2;
     }
     /* AVX-512: 显式指定 (HYMT2_ISA=avx512) 时只要 CPU 支持就用; auto 时仅在有 VNNI 的较新核心上启用
      * (没有 VNNI 的 Skylake-X 类核心跑 512 位指令会降频, 收益不稳, 需要的话手动指定) */
-    if (max_level >= 4 && g_cb_ok && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
-        __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("f16c")) {
-        bool vnni = __builtin_cpu_supports("avx512vnni") && !(name && !strcmp(name, "avx512-bw"));
+    if (max_level >= 4 && g_cb_ok && HY_CPU_SUPPORTS("avx512f") && HY_CPU_SUPPORTS("avx512bw") &&
+        HY_CPU_SUPPORTS("avx512vl") && HY_CPU_SUPPORTS("avx512dq") && HY_CPU_SUPPORTS("f16c")) {
+        bool vnni = HY_CPU_SUPPORTS("avx512vnni") && !(name && !strcmp(name, "avx512-bw"));
         if (!want_auto || vnni) {
             g_stq_rows = vnni ? stq_rows_avx512_vnni : stq_rows_avx512;
             g_panel_rows = vnni ? panel_rows_avx512_vnni : panel_rows_avx512;
@@ -1642,8 +1681,8 @@ const char *kernels_cpu_features(void) {
     static char buf[256];
     buf[0] = 0;
 #ifdef HY_X86
-    __builtin_cpu_init();
-#define FEAT(n) do { if (__builtin_cpu_supports(n)) { if (buf[0]) strcat(buf, " "); strcat(buf, n); } } while (0)
+    HY_CPU_INIT();
+#define FEAT(n) do { if (HY_CPU_SUPPORTS(n)) { if (buf[0]) strcat(buf, " "); strcat(buf, n); } } while (0)
     FEAT("ssse3"); FEAT("sse4.1"); FEAT("sse4.2"); FEAT("avx"); FEAT("avx2"); FEAT("f16c"); FEAT("fma");
     FEAT("avx512f"); FEAT("avx512bw"); FEAT("avx512vl"); FEAT("avx512dq"); FEAT("avx512vnni");
 #undef FEAT

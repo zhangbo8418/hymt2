@@ -1,10 +1,17 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 cd /d "%~dp0.."
 
+rem Prefer clang-cl: source uses GCC/Clang target multiversion + builtins.
+rem nvcc still needs MSVC for .cu host; clang-cl links with the same link.exe.
+where clang-cl >nul 2>nul
+if errorlevel 1 (
+  echo ERROR: clang-cl not on PATH. Install LLVM or use a runner with LLVM.
+  exit /b 1
+)
 where cl >nul 2>nul
 if errorlevel 1 (
-  echo ERROR: cl.exe not on PATH
+  echo ERROR: cl.exe not on PATH ^(needed by nvcc host^)
   exit /b 1
 )
 where nvcc >nul 2>nul
@@ -21,12 +28,13 @@ if not exist "%CUDA_LIB%\cudart.lib" set "CUDA_LIB=%CUDA_BIN%..\lib"
 
 echo NVCC=%NVCC%
 nvcc --version
+clang-cl --version
 
 if not exist build_msvc mkdir build_msvc
 
-rem Universal: CUDA + Vulkan + CPU. Vulkan is LoadLibrary(vulkan-1.dll) at runtime.
-rem CUDA uses delay-load so missing cudart still lets Vulkan/CPU run.
-set CFLAGS=/nologo /O2 /MD /W3 /D_CRT_SECURE_NO_WARNINGS /DHYMT2_CUDA=1 /D_WIN32_WINNT=0x0601 /DWINVER=0x0601 /Ithird_party\vulkan /Isrc /Iinclude /I"%CUDA_INC%"
+rem Universal: CUDA + Vulkan + CPU. Vulkan = LoadLibrary(vulkan-1.dll).
+rem CUDA delay-load so missing cudart still allows Vulkan/CPU.
+set CFLAGS=/nologo /O2 /MD /W3 /std:c11 /D_CRT_SECURE_NO_WARNINGS /DHYMT2_CUDA=1 /D_WIN32_WINNT=0x0601 /DWINVER=0x0601 /Ithird_party\vulkan /Isrc /Iinclude /I"%CUDA_INC%"
 
 echo === nvcc ===
 nvcc -O3 -c -Xcompiler "/MD /nologo" -o build_msvc\cuda_kernels.obj src\cuda_kernels.cu
@@ -34,28 +42,28 @@ if errorlevel 1 exit /b 1
 nvcc -O3 -c -Xcompiler "/MD /nologo" -o build_msvc\cuda_fused.obj src\cuda_fused.cu
 if errorlevel 1 exit /b 1
 
-echo === cl ===
-cl %CFLAGS% /c /Fobuild_msvc\hymt2_cli.obj tools\hymt2_cli.c
+echo === clang-cl ===
+clang-cl %CFLAGS% /c /Fobuild_msvc\hymt2_cli.obj tools\hymt2_cli.c
 if errorlevel 1 exit /b 1
-cl %CFLAGS% /c /Fobuild_msvc\model.obj src\model.c
+clang-cl %CFLAGS% /c /Fobuild_msvc\model.obj src\model.c
 if errorlevel 1 exit /b 1
-cl %CFLAGS% /c /Fobuild_msvc\kernels.obj src\kernels.c
+clang-cl %CFLAGS% /c /Fobuild_msvc\kernels.obj src\kernels.c
 if errorlevel 1 exit /b 1
-cl %CFLAGS% /c /Fobuild_msvc\gguf.obj src\gguf.c
+clang-cl %CFLAGS% /c /Fobuild_msvc\gguf.obj src\gguf.c
 if errorlevel 1 exit /b 1
-cl %CFLAGS% /c /Fobuild_msvc\tokenizer.obj src\tokenizer.c
+clang-cl %CFLAGS% /c /Fobuild_msvc\tokenizer.obj src\tokenizer.c
 if errorlevel 1 exit /b 1
-cl %CFLAGS% /c /Fobuild_msvc\threadpool.obj src\threadpool.c
+clang-cl %CFLAGS% /c /Fobuild_msvc\threadpool.obj src\threadpool.c
 if errorlevel 1 exit /b 1
-cl %CFLAGS% /c /Fobuild_msvc\vulkan.obj src\vulkan.c
+clang-cl %CFLAGS% /c /Fobuild_msvc\vulkan.obj src\vulkan.c
 if errorlevel 1 exit /b 1
-cl %CFLAGS% /c /Fobuild_msvc\device.obj src\device.c
+clang-cl %CFLAGS% /c /Fobuild_msvc\device.obj src\device.c
 if errorlevel 1 exit /b 1
-cl %CFLAGS% /c /Fobuild_msvc\cuda.obj src\cuda.c
+clang-cl %CFLAGS% /c /Fobuild_msvc\cuda.obj src\cuda.c
 if errorlevel 1 exit /b 1
-cl %CFLAGS% /c /Fobuild_msvc\npu.obj src\npu.c
+clang-cl %CFLAGS% /c /Fobuild_msvc\npu.obj src\npu.c
 if errorlevel 1 exit /b 1
-cl %CFLAGS% /c /Fobuild_msvc\metal_stub.obj src\metal_stub.c
+clang-cl %CFLAGS% /c /Fobuild_msvc\metal_stub.obj src\metal_stub.c
 if errorlevel 1 exit /b 1
 
 echo === resolve cudart dll name for DELAYLOAD ===

@@ -11,6 +11,13 @@
 #define QK_K 256
 #define MAX_BATCH 16 /* 一次前向最多处理的 token 数 (prefill 分块) */
 
+/* MSVC 不认 GCC/Clang 的 __attribute__((aligned)); 用可移植写法 */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define HY_ALIGN(n) __declspec(align(n))
+#else
+#define HY_ALIGN(n) __attribute__((aligned(n)))
+#endif
+
 #pragma pack(push, 1)
 typedef struct { uint8_t qs[32]; uint8_t sign[8]; uint16_t d; } block_stq1_0; /* 42 B / 256 权重 */
 typedef struct { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; uint16_t d; } block_q6_k; /* 210 B */
@@ -24,7 +31,7 @@ typedef struct { uint16_t d; uint8_t qs[128]; } block_q2_0c; /* 130 B / 512 权�
  *         这样 SSE (16B)、AVX2 (32B)、AVX-512 (64B) 都能用连续对齐的整块加载。
  *   qs  : 自然顺序, Q6_K 与标量路径用。 */
 #define Q8K_PIECE_ORDER {0, 2, 1, 3}
-typedef struct __attribute__((aligned(64))) {
+typedef struct HY_ALIGN(64) {
     int8_t qp[QK_K];
     float d;
     int32_t sum;
