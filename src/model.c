@@ -159,15 +159,28 @@ static float *load_vec(hymt2_model *m, const char *name, int n) {
 static int default_threads(void) {
     const char *e = getenv("HYMT2_THREADS");
     if (e && atoi(e) > 0) return atoi(e);
-    /* 默认只用物理核；超线程逻辑核并行会争用同一执行单元，实测常更慢。 */
-    int n = hy_physical_cpu_count();
-    if (n < 1) n = 1;
-#if defined(__ANDROID__)
-    /* 端侧 LLM 多为访存瓶颈: MT6899 上 4 线程 decode 优于 8 (争用 LLC/总线)。
-     * J4125 等 x86 弱 U 不走此分支; 可用 HYMT2_THREADS 覆盖。 */
-    if (n > 4) n = 4;
+    /* 恢复与原始 zip 一致: 默认用逻辑核并封顶 8。
+     * 曾改成物理核后, 4c/8t 机器从 8→4 线程, decode 从 ~23 掉到 ~16 tok/s。
+     * Android 仍用物理核并封顶 4 (端侧 LLC/总线争用更明显)。 */
+    long n = 1;
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    n = (long)si.dwNumberOfProcessors;
+#else
+    n = sysconf(_SC_NPROCESSORS_ONLN);
 #endif
-    return n;
+#if defined(__ANDROID__)
+    {
+        int phys = hy_physical_cpu_count();
+        if (phys > 0) n = phys;
+        if (n > 4) n = 4;
+    }
+#else
+    if (n > 8) n = 8;
+#endif
+    if (n < 1) n = 1;
+    return (int)n;
 }
 
 void hymt2_model_free(hymt2_model *m) {
@@ -792,14 +805,18 @@ static void forward_batch(hymt2_model *m, const int *toks, int nt, int pos0, boo
         }
     }
 
+    /* 纯 CPU: 走原始 zip 同款直写缓冲路径 (无 gpu_out 间接), 避免 23→16 tok/s 回归。
+     * GPU/逐算子设备: 仍用 gpu_out 映射输出缓冲。 */
+    const bool cpu_fast = !(m->use_gpu && m->dev);
+
     for (int li = 0; li < m->n_layer; li++) {
         const layer_t *L = &m->L[li];
         /* ---- 注意力 ---- */
         for (int t = 0; t < nt; t++) rmsnorm(m->h + (size_t)t * H, L->attn_norm, m->xn + (size_t)t * H, H, m->eps);
         quantize_rows(m->xn, nt, H, m->xq_h);
-        float *qbuf = gpu_out(m, &L->wq, m->q);
-        float *kbuf = gpu_out(m, &L->wk, m->k);
-        float *vbuf = gpu_out(m, &L->wv, m->v);
+        float *qbuf = cpu_fast ? m->q : gpu_out(m, &L->wq, m->q);
+        float *kbuf = cpu_fast ? m->k : gpu_out(m, &L->wk, m->k);
+        float *vbuf = cpu_fast ? m->v : gpu_out(m, &L->wv, m->v);
         {
             const weight_t *ws[3] = { &L->wq, &L->wk, &L->wv };
             float *os[3] = { qbuf, kbuf, vbuf };
@@ -813,23 +830,31 @@ static void forward_batch(hymt2_model *m, const int *toks, int nt, int pos0, boo
             for (int h = 0; h < m->heads; h++) rmsnorm(q + (size_t)h * m->hdim, L->q_norm, q + (size_t)h * m->hdim, m->hdim, m->eps);
             for (int h = 0; h < m->kv_heads; h++) rmsnorm(k + (size_t)h * m->hdim, L->k_norm, k + (size_t)h * m->hdim, m->hdim, m->eps);
             uint16_t *kd = m->kc[li] + (size_t)(pos0 + t) * m->kvdim, *vd = m->vc[li] + (size_t)(pos0 + t) * m->kvdim;
-            store_bf16_pair(k, v, kd, vd, m->kvdim);
+            if (cpu_fast) {
+                for (int d = 0; d < m->kvdim; d++) { kd[d] = f32_to_bf16(k[d]); vd[d] = f32_to_bf16(v[d]); }
+            } else {
+                store_bf16_pair(k, v, kd, vd, m->kvdim);
+            }
         }
         PROF_END(2);
-        attn_ctx ac = { m, li, nt, pos0, qbuf };
+        attn_ctx ac = { m, li, nt, pos0, cpu_fast ? NULL : qbuf };
         tp_for(m->tp, nt * m->heads, 1, attn_task, &ac);
         PROF_END(3);
         quantize_rows(m->ao, nt, m->qdim, m->xq_q);
-        float *wo_out = gpu_out(m, &L->wo, m->tmp);
+        float *wo_out = cpu_fast ? m->tmp : gpu_out(m, &L->wo, m->tmp);
         matmul(m, &L->wo, m->ao, m->xq_q, nt, wo_out);
-        residual_add(m->h, wo_out, nt * H);
+        if (cpu_fast) {
+            for (size_t i = 0; i < (size_t)nt * H; i++) m->h[i] += wo_out[i];
+        } else {
+            residual_add(m->h, wo_out, nt * H);
+        }
         PROF_END(4);
 
         /* ---- 前馈 ---- */
         for (int t = 0; t < nt; t++) rmsnorm(m->h + (size_t)t * H, L->ffn_norm, m->xn + (size_t)t * H, H, m->eps);
         quantize_rows(m->xn, nt, H, m->xq_h);
-        float *gbuf = gpu_out(m, &L->wg, m->gate);
-        float *ubuf = gpu_out(m, &L->wu, m->up);
+        float *gbuf = cpu_fast ? m->gate : gpu_out(m, &L->wg, m->gate);
+        float *ubuf = cpu_fast ? m->up : gpu_out(m, &L->wu, m->up);
         {
             const weight_t *ws[2] = { &L->wg, &L->wu };
             float *os[2] = { gbuf, ubuf };
@@ -840,9 +865,13 @@ static void forward_batch(hymt2_model *m, const int *toks, int nt, int pos0, boo
             gbuf[i] = g / (1.0f + expf(-g)) * ubuf[i];
         }
         quantize_rows(gbuf, nt, m->ffn, m->xq_f);
-        float *wd_out = gpu_out(m, &L->wd, m->tmp);
+        float *wd_out = cpu_fast ? m->tmp : gpu_out(m, &L->wd, m->tmp);
         matmul(m, &L->wd, gbuf, m->xq_f, nt, wd_out);
-        residual_add(m->h, wd_out, nt * H);
+        if (cpu_fast) {
+            for (size_t i = 0; i < (size_t)nt * H; i++) m->h[i] += wd_out[i];
+        } else {
+            residual_add(m->h, wd_out, nt * H);
+        }
         PROF_END(5);
     }
 
@@ -850,9 +879,13 @@ static void forward_batch(hymt2_model *m, const int *toks, int nt, int pos0, boo
         float *last = m->h + (size_t)(nt - 1) * H;
         rmsnorm(last, m->out_norm, m->xn, H, m->eps);
         quantize_rows(m->xn, 1, H, m->xq_h);
-        float *lout = gpu_out(m, &m->outw, m->logits);
-        matmul(m, &m->outw, m->xn, m->xq_h, 1, lout);
-        if (lout != m->logits) memcpy(m->logits, lout, sizeof(float) * (size_t)m->outw.n);
+        if (cpu_fast) {
+            matmul(m, &m->outw, m->xn, m->xq_h, 1, m->logits);
+        } else {
+            float *lout = gpu_out(m, &m->outw, m->logits);
+            matmul(m, &m->outw, m->xn, m->xq_h, 1, lout);
+            if (lout != m->logits) memcpy(m->logits, lout, sizeof(float) * (size_t)m->outw.n);
+        }
         PROF_END(6);
     }
 }

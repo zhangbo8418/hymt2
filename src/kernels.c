@@ -8,8 +8,7 @@
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
 #define HY_X86 1
 #include <immintrin.h>
-/* clang-cl 支持 target 多版本; 但 Windows 上 __builtin_cpu_supports 要链 clang_rt,
- * 用 link.exe 会 LNK2019, 故 Win 一律 CPUID。 */
+/* clang-cl 支持 target 多版本; Windows 上 __builtin_cpu_supports 需 clang_rt, 改走 CPUID。 */
 #if defined(__GNUC__) || defined(__clang__)
 #define HY_TARGET(...) __attribute__((target(__VA_ARGS__)))
 #else
@@ -25,7 +24,6 @@ static int hy_cpu_bit(int leaf, int sub, int reg, int bit) {
     __cpuidex(info, leaf, sub);
     return (info[reg] >> bit) & 1;
 }
-static void hy_cpu_init_win(void) { (void)0; }
 static int hy_cpu_supports_win(const char *feat) {
     if (!strcmp(feat, "ssse3")) return hy_cpu_bit(1, 0, 2, 9);
     if (!strcmp(feat, "sse4.1")) return hy_cpu_bit(1, 0, 2, 19);
@@ -38,41 +36,21 @@ static int hy_cpu_supports_win(const char *feat) {
     if (!strcmp(feat, "avx512dq")) return hy_cpu_bit(7, 0, 1, 17);
     if (!strcmp(feat, "avx512bw")) return hy_cpu_bit(7, 0, 1, 30);
     if (!strcmp(feat, "avx512vl")) return hy_cpu_bit(7, 0, 1, 31);
-    if (!strcmp(feat, "avx512vnni")) return hy_cpu_bit(7, 0, 2, 11); /* ECX bit 11 */
+    if (!strcmp(feat, "avx512vnni")) return hy_cpu_bit(7, 0, 2, 11);
     return 0;
 }
-#define HY_CPU_INIT() hy_cpu_init_win()
+#define HY_CPU_INIT() ((void)0)
 #define HY_CPU_SUPPORTS(feat) hy_cpu_supports_win(feat)
 #endif
+#else
+#define HY_TARGET(...)
 #endif
 #if defined(__aarch64__)
 #define HY_NEON 1
 #include <arm_neon.h>
-#if defined(__linux__) || defined(__ANDROID__)
-#include <sys/auxv.h>
-#ifndef AT_HWCAP
-#define AT_HWCAP 16
-#endif
-/* glibc/bionic: ASIMDDP=1<<20, I8MM 在 HWCAP2。运行时探测, 避免整库 -march=dotprod 在老核上 SIGILL。 */
-#ifndef HWCAP_ASIMDDP
-#define HWCAP_ASIMDDP (1 << 20)
-#endif
-#endif
-#if defined(__clang__) || defined(__GNUC__)
-#define HY_ARM_DOTPROD_TARGET __attribute__((target("+dotprod")))
-#else
-#define HY_ARM_DOTPROD_TARGET
-#endif
 #endif
 
 #include <stdlib.h>
-#if defined(__GNUC__) || defined(__clang__)
-#define HY_PREFETCH(addr) __builtin_prefetch((addr), 0, 3)
-#elif defined(HY_X86)
-#define HY_PREFETCH(addr) _mm_prefetch((const char *)(addr), _MM_HINT_T2)
-#else
-#define HY_PREFETCH(addr) ((void)0)
-#endif
 #ifdef _WIN32
 #include <malloc.h>
 void *hy_aligned_alloc(size_t size) { return _aligned_malloc(size, 64); }
@@ -142,32 +120,13 @@ size_t row_size(int type, int k) {
 
 void quantize_q8k(const float *x, int k, q8k_block *y) {
     int nb = k / QK_K;
-    static const int cord[4] = Q8K_PIECE_ORDER;
     for (int i = 0; i < nb; i++) {
         const float *src = x + (size_t)i * QK_K;
         float amax = 0.f, max = 0.f;
-#if defined(HY_NEON)
-        {
-            float32x4_t vmax = vdupq_n_f32(0.f), vamax = vdupq_n_f32(0.f);
-            for (int j = 0; j < QK_K; j += 4) {
-                float32x4_t v = vld1q_f32(src + j);
-                float32x4_t ax = vabsq_f32(v);
-                uint32x4_t m = vcgtq_f32(ax, vamax);
-                vamax = vbslq_f32(m, ax, vamax);
-                vmax = vbslq_f32(m, v, vmax);
-            }
-            float ax4[4], vx4[4];
-            vst1q_f32(ax4, vamax);
-            vst1q_f32(vx4, vmax);
-            for (int j = 0; j < 4; j++)
-                if (ax4[j] > amax) { amax = ax4[j]; max = vx4[j]; }
-        }
-#else
         for (int j = 0; j < QK_K; j++) { /* 取"第一个绝对值最大"的元素 (带符号) */
             float ax = fabsf(src[j]);
             if (ax > amax) { amax = ax; max = src[j]; }
         }
-#endif
         q8k_block *b = &y[i];
         if (amax == 0.f) {
             memset(b, 0, sizeof(*b));
@@ -177,29 +136,6 @@ void quantize_q8k(const float *x, int k, q8k_block *y) {
         float iscale = -127.f / max;
         b->d = 1.f / iscale;
         int total = 0;
-#if defined(HY_NEON)
-        {
-            const float32x4_t scale = vdupq_n_f32(iscale);
-            const float32x4_t lo = vdupq_n_f32(-127.f), hi = vdupq_n_f32(127.f);
-            for (int g = 0; g < QK_K / 16; g++) {
-                int32x4_t s4 = vdupq_n_s32(0);
-                for (int j = 0; j < 16; j += 4) {
-                    float32x4_t v = vminq_f32(hi, vmaxq_f32(lo, vmulq_f32(scale, vld1q_f32(src + g * 16 + j))));
-                    int32x4_t qi = vcvtnq_s32_f32(v); /* 就近偶数, 对齐 lrintf */
-                    int32_t tmp[4];
-                    vst1q_s32(tmp, qi);
-                    b->qs[g * 16 + j + 0] = (int8_t)tmp[0];
-                    b->qs[g * 16 + j + 1] = (int8_t)tmp[1];
-                    b->qs[g * 16 + j + 2] = (int8_t)tmp[2];
-                    b->qs[g * 16 + j + 3] = (int8_t)tmp[3];
-                    s4 = vaddq_s32(s4, qi);
-                }
-                int s = (int)vaddvq_s32(s4);
-                b->bsums[g] = (int16_t)s;
-                total += s;
-            }
-        }
-#else
         for (int g = 0; g < QK_K / 16; g++) {
             int s = 0;
             for (int j = 0; j < 16; j++) {
@@ -212,9 +148,9 @@ void quantize_q8k(const float *x, int k, q8k_block *y) {
             b->bsums[g] = (int16_t)s;
             total += s;
         }
-#endif
         b->sum = total;
         /* 重排副本 qp[l][j] = qs 的 chunk CORD[j] 的 lane l (见 q8k_block 注释) */
+        static const int cord[4] = Q8K_PIECE_ORDER;
         for (int l = 0; l < 4; l++)
             for (int j = 0; j < 4; j++)
                 memcpy(b->qp + l * 64 + j * 16, b->qs + cord[j] * 64 + l * 16, 16);
@@ -412,46 +348,40 @@ static inline void stq_chunk_codes_neon(const uint8_t *qs, const uint8_t *sg, ui
     out[3] = vshrq_n_u8(qp, 6);
 }
 
-/* 无 DOTPROD 的通用 NEON 点积 (老 aarch64 / 未探测到 asimddp)。 */
-static inline int32x4_t neon_dot_mul(int32x4_t acc, int8x16_t c, int8x16_t a) {
+static inline int32x4_t neon_dot(int32x4_t acc, int8x16_t c, int8x16_t a) {
+#ifdef __ARM_FEATURE_DOTPROD
+    return vdotq_s32(acc, c, a);
+#else
     acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(c), vget_low_s8(a)));
     return vpadalq_s16(acc, vmull_high_s8(c, a));
+#endif
 }
-
-#define STQ_ROWS_NEON_BODY(DOT)                                                                                        \
-    static const int cord[4] = Q8K_PIECE_ORDER;                                                                         \
-    const int nb = w->k / QK_K;                                                                                         \
-    const uint8x16_t tlo = vld1q_u8(STQ_CODEBOOK), thi = vld1q_u8(STQ_CODEBOOK + 16);                                   \
-    for (int r = r0; r < r1; r++) {                                                                                     \
-        const block_stq1_0 *row = (const block_stq1_0 *)(w->data + (size_t)r * w->row_bytes);                           \
-        float acc[MAX_BATCH];                                                                                          \
-        for (int t = 0; t < nt; t++) acc[t] = 0.f;                                                                      \
-        for (int b = 0; b < nb; b++) {                                                                                  \
-            uint8x16_t codes[4][4];                                                                                    \
-            for (int c = 0; c < 4; c++)                                                                                 \
-                stq_chunk_codes_neon(row[b].qs + c * 8, row[b].sign + c * 2, codes[c], tlo, thi);                       \
-            const float wd = f16_hw(row[b].d);                                                                          \
-            for (int t = 0; t < nt; t++) {                                                                              \
-                const q8k_block *y = xq + (size_t)t * nb + b;                                                           \
-                int32x4_t s = vdupq_n_s32(0);                                                                           \
-                for (int c = 0; c < 4; c++)                                                                             \
-                    for (int l = 0; l < 4; l++)                                                                         \
-                        s = (DOT)(s, vreinterpretq_s8_u8(codes[c][l]), vld1q_s8(y->qp + l * 64 + cord[c] * 16));      \
-                acc[t] += wd * y->d * (float)(vaddvq_s32(s) - y->sum);                                                  \
-            }                                                                                                          \
-        }                                                                                                              \
-        for (int t = 0; t < nt; t++) out[(size_t)t * w->n + r] = acc[t];                                                 \
-    }
 
 static void stq_rows_neon(const weight_t *w, int r0, int r1, const q8k_block *xq, int nt, float *out) {
-    STQ_ROWS_NEON_BODY(neon_dot_mul)
+    static const int cord[4] = Q8K_PIECE_ORDER;
+    const int nb = w->k / QK_K;
+    const uint8x16_t tlo = vld1q_u8(STQ_CODEBOOK), thi = vld1q_u8(STQ_CODEBOOK + 16);
+    for (int r = r0; r < r1; r++) {
+        const block_stq1_0 *row = (const block_stq1_0 *)(w->data + (size_t)r * w->row_bytes);
+        float acc[MAX_BATCH];
+        for (int t = 0; t < nt; t++) acc[t] = 0.f;
+        for (int b = 0; b < nb; b++) {
+            uint8x16_t codes[4][4];
+            for (int c = 0; c < 4; c++)
+                stq_chunk_codes_neon(row[b].qs + c * 8, row[b].sign + c * 2, codes[c], tlo, thi);
+            const float wd = f16_hw(row[b].d);
+            for (int t = 0; t < nt; t++) {
+                const q8k_block *y = xq + (size_t)t * nb + b;
+                int32x4_t s = vdupq_n_s32(0);
+                for (int c = 0; c < 4; c++)
+                    for (int l = 0; l < 4; l++)
+                        s = neon_dot(s, vreinterpretq_s8_u8(codes[c][l]), vld1q_s8(y->qp + l * 64 + cord[c] * 16));
+                acc[t] += wd * y->d * (float)(vaddvq_s32(s) - y->sum);
+            }
+        }
+        for (int t = 0; t < nt; t++) out[(size_t)t * w->n + r] = acc[t];
+    }
 }
-
-HY_ARM_DOTPROD_TARGET
-static void stq_rows_neon_dotprod(const weight_t *w, int r0, int r1, const q8k_block *xq, int nt, float *out) {
-    STQ_ROWS_NEON_BODY(vdotq_s32)
-}
-#undef STQ_ROWS_NEON_BODY
 #endif /* HY_NEON */
 
 #ifdef HY_X86
@@ -809,106 +739,37 @@ static void panel_rows_avx512_vnni(const weight_t *w, int r0, int r1, const q8k_
 #endif /* HY_X86 (panel) */
 
 #ifdef HY_NEON
-/* 行外提 + 预取下一组行: 权重顺序读 (带宽主导); nt==1 不解包临时表; 多 token 时权重只解一次。
- * 注意: 块外提多行会跨 nb*64 大跨度读权重, 在手机上实测更慢, 不要改回去。 */
-#define PANEL_ROWS_NEON_BODY(DOT)                                                                                      \
-    const int nb = w->k / QK_K;                                                                                         \
-    const int pfr = (int)(HY_PF_BYTES / ((size_t)nb * 64));                                                             \
-    const int pref = pfr < 1 ? 1 : pfr;                                                                                 \
-    const uint8x16_t m3 = vdupq_n_u8(3);                                                                                \
-    const int sh = w->pshift, off = w->poff;                                                                            \
-    for (int r = r0; r < r1; r++) {                                                                                     \
-        const uint8_t *pk = w->pk + (size_t)r * (size_t)nb * 64;                                                        \
-        const float *ps = w->ps + (size_t)r * (size_t)nb;                                                                \
-        if (r + pref < r1) {                                                                                           \
-            const uint8_t *nx = pk + (size_t)nb * 64 * (size_t)pref;                                                    \
-            for (int b = 0; b < nb; b += 4) {                                                                           \
-                HY_PREFETCH(nx + (size_t)b * 64);                                                         \
-                if (b + 2 < nb) HY_PREFETCH(nx + (size_t)(b + 2) * 64);                                   \
-            }                                                                                                          \
-        }                                                                                                              \
-        float acc[MAX_BATCH];                                                                                          \
-        for (int t = 0; t < nt; t++) acc[t] = 0.f;                                                                      \
-        if (nt == 1) {                                                                                                 \
-            const q8k_block *y0 = xq;                                                                                   \
-            int b = 0;                                                                                                 \
-            for (; b + 1 < nb; b += 2) {                                                                                \
-                int32x4_t s0 = vdupq_n_s32(0), s1 = vdupq_n_s32(0);                                                     \
-                const int8_t *qp0 = y0[b].qp, *qp1 = y0[b + 1].qp;                                                      \
-                for (int j = 0; j < 4; j++) {                                                                           \
-                    uint8x16_t v0 = vld1q_u8(pk + b * 64 + j * 16);                                                     \
-                    uint8x16_t v1 = vld1q_u8(pk + (b + 1) * 64 + j * 16);                                               \
-                    s0 = (DOT)(s0, vreinterpretq_s8_u8(vandq_u8(v0, m3)), vld1q_s8(qp0 + j * 16));                      \
-                    s1 = (DOT)(s1, vreinterpretq_s8_u8(vandq_u8(v1, m3)), vld1q_s8(qp1 + j * 16));                      \
-                    s0 = (DOT)(s0, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v0, 2), m3)), vld1q_s8(qp0 + 64 + j * 16)); \
-                    s1 = (DOT)(s1, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v1, 2), m3)), vld1q_s8(qp1 + 64 + j * 16)); \
-                    s0 = (DOT)(s0, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v0, 4), m3)), vld1q_s8(qp0 + 128 + j * 16));\
-                    s1 = (DOT)(s1, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v1, 4), m3)), vld1q_s8(qp1 + 128 + j * 16));\
-                    s0 = (DOT)(s0, vreinterpretq_s8_u8(vshrq_n_u8(v0, 6)), vld1q_s8(qp0 + 192 + j * 16));               \
-                    s1 = (DOT)(s1, vreinterpretq_s8_u8(vshrq_n_u8(v1, 6)), vld1q_s8(qp1 + 192 + j * 16));               \
-                }                                                                                                      \
-                acc[0] += ps[b] * y0[b].d * (float)((vaddvq_s32(s0) << sh) - off * y0[b].sum);                          \
-                acc[0] += ps[b + 1] * y0[b + 1].d * (float)((vaddvq_s32(s1) << sh) - off * y0[b + 1].sum);             \
-            }                                                                                                          \
-            for (; b < nb; b++) {                                                                                      \
-                const int8_t *qp = y0[b].qp;                                                                            \
-                int32x4_t s = vdupq_n_s32(0);                                                                           \
-                for (int j = 0; j < 4; j++) {                                                                           \
-                    uint8x16_t v = vld1q_u8(pk + b * 64 + j * 16);                                                      \
-                    s = (DOT)(s, vreinterpretq_s8_u8(vandq_u8(v, m3)), vld1q_s8(qp + j * 16));                          \
-                    s = (DOT)(s, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v, 2), m3)), vld1q_s8(qp + 64 + j * 16));     \
-                    s = (DOT)(s, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v, 4), m3)), vld1q_s8(qp + 128 + j * 16));    \
-                    s = (DOT)(s, vreinterpretq_s8_u8(vshrq_n_u8(v, 6)), vld1q_s8(qp + 192 + j * 16));                  \
-                }                                                                                                      \
-                acc[0] += ps[b] * y0[b].d * (float)((vaddvq_s32(s) << sh) - off * y0[b].sum);                           \
-            }                                                                                                          \
-        } else {                                                                                                       \
-            for (int b = 0; b < nb; b++) {                                                                              \
-                int8x16_t p[4][4];                                                                                     \
-                for (int j = 0; j < 4; j++) {                                                                           \
-                    uint8x16_t v = vld1q_u8(pk + b * 64 + j * 16);                                                      \
-                    p[j][0] = vreinterpretq_s8_u8(vandq_u8(v, m3));                                                    \
-                    p[j][1] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v, 2), m3));                                     \
-                    p[j][2] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v, 4), m3));                                     \
-                    p[j][3] = vreinterpretq_s8_u8(vshrq_n_u8(v, 6));                                                   \
-                }                                                                                                      \
-                const float sc = ps[b];                                                                                \
-                int t = 0;                                                                                             \
-                for (; t + 1 < nt; t += 2) {                                                                            \
-                    const q8k_block *y0 = xq + (size_t)t * (size_t)nb + (size_t)b;                                      \
-                    const q8k_block *y1 = y0 + nb;                                                                      \
-                    int32x4_t s0 = vdupq_n_s32(0), s1 = vdupq_n_s32(0);                                                 \
-                    for (int l = 0; l < 4; l++)                                                                         \
-                        for (int j = 0; j < 4; j++) {                                                                   \
-                            int8x16_t pv = p[j][l];                                                                     \
-                            s0 = (DOT)(s0, pv, vld1q_s8(y0->qp + l * 64 + j * 16));                                    \
-                            s1 = (DOT)(s1, pv, vld1q_s8(y1->qp + l * 64 + j * 16));                                    \
-                        }                                                                                              \
-                    acc[t] += sc * y0->d * (float)((vaddvq_s32(s0) << sh) - off * y0->sum);                             \
-                    acc[t + 1] += sc * y1->d * (float)((vaddvq_s32(s1) << sh) - off * y1->sum);                         \
-                }                                                                                                      \
-                for (; t < nt; t++) {                                                                                  \
-                    const q8k_block *y = xq + (size_t)t * (size_t)nb + (size_t)b;                                       \
-                    int32x4_t s = vdupq_n_s32(0);                                                                       \
-                    for (int l = 0; l < 4; l++)                                                                         \
-                        for (int j = 0; j < 4; j++)                                                                     \
-                            s = (DOT)(s, p[j][l], vld1q_s8(y->qp + l * 64 + j * 16));                                  \
-                    acc[t] += sc * y->d * (float)((vaddvq_s32(s) << sh) - off * y->sum);                                \
-                }                                                                                                      \
-            }                                                                                                          \
-        }                                                                                                              \
-        for (int t = 0; t < nt; t++) out[(size_t)t * (size_t)w->n + (size_t)r] = acc[t];                                 \
-    }
-
 static void panel_rows_neon(const weight_t *w, int r0, int r1, const q8k_block *xq, int nt, float *out) {
-    PANEL_ROWS_NEON_BODY(neon_dot_mul)
+    const int nb = w->k / QK_K;
+    const uint8x16_t m3 = vdupq_n_u8(3);
+    const int sh = w->pshift, off = w->poff;
+    for (int r = r0; r < r1; r++) {
+        const uint8_t *pk = w->pk + (size_t)r * nb * 64;
+        const float *ps = w->ps + (size_t)r * nb;
+        float acc[MAX_BATCH];
+        for (int t = 0; t < nt; t++) acc[t] = 0.f;
+        for (int b = 0; b < nb; b++) {
+            uint8x16_t v[4], p[4][4];
+            for (int j = 0; j < 4; j++) {
+                v[j] = vld1q_u8(pk + b * 64 + j * 16);
+                p[j][0] = vandq_u8(v[j], m3);
+                p[j][1] = vandq_u8(vshrq_n_u8(v[j], 2), m3);
+                p[j][2] = vandq_u8(vshrq_n_u8(v[j], 4), m3);
+                p[j][3] = vshrq_n_u8(v[j], 6);
+            }
+            const float sc = ps[b];
+            for (int t = 0; t < nt; t++) {
+                const q8k_block *y = xq + (size_t)t * nb + b;
+                int32x4_t s = vdupq_n_s32(0);
+                for (int l = 0; l < 4; l++)
+                    for (int j = 0; j < 4; j++)
+                        s = neon_dot(s, vreinterpretq_s8_u8(p[j][l]), vld1q_s8(y->qp + l * 64 + j * 16));
+                acc[t] += sc * y->d * (float)((vaddvq_s32(s) << sh) - off * y->sum);
+            }
+        }
+        for (int t = 0; t < nt; t++) out[(size_t)t * w->n + r] = acc[t];
+    }
 }
-
-HY_ARM_DOTPROD_TARGET
-static void panel_rows_neon_dotprod(const weight_t *w, int r0, int r1, const q8k_block *xq, int nt, float *out) {
-    PANEL_ROWS_NEON_BODY(vdotq_s32)
-}
-#undef PANEL_ROWS_NEON_BODY
 #endif /* HY_NEON (panel) */
 
 static panel_rows_fn g_panel_rows = panel_rows_scalar;
@@ -1077,47 +938,6 @@ static float q4_k_dot_avx2(const block_q4_k *x, const q8k_block *y, int nb) {
 
 #endif /* HY_X86 (q4k) */
 
-#ifdef HY_NEON
-static float q4_k_dot_neon(const block_q4_k *x, const q8k_block *y, int nb) {
-    const uint8x16_t m0f = vdupq_n_u8(0x0F);
-    float sumf = 0.f;
-    for (int i = 0; i < nb; i++) {
-        uint8_t sc[8], mn[8];
-        for (int j = 0; j < 8; j++) k4_scale_min(x[i].scales, j, &sc[j], &mn[j]);
-        int32x4_t sumi = vdupq_n_s32(0);
-        for (int g = 0; g < 4; g++) {
-            const uint8_t *q = x[i].qs + 32 * g;
-            const int8_t *a = y[i].qs + 64 * g;
-            uint8x16_t q0 = vld1q_u8(q), q1 = vld1q_u8(q + 16);
-            uint8x16_t lo0 = vandq_u8(q0, m0f), lo1 = vandq_u8(q1, m0f);
-            uint8x16_t hi0 = vandq_u8(vshrq_n_u8(q0, 4), m0f), hi1 = vandq_u8(vshrq_n_u8(q1, 4), m0f);
-            int8x16_t a0 = vld1q_s8(a), a1 = vld1q_s8(a + 16), a2 = vld1q_s8(a + 32), a3 = vld1q_s8(a + 48);
-#ifdef __ARM_FEATURE_DOTPROD
-            int32x4_t s0 = vdotq_s32(vdupq_n_s32(0), vreinterpretq_s8_u8(lo0), a0);
-            s0 = vdotq_s32(s0, vreinterpretq_s8_u8(lo1), a1);
-            int32x4_t s1 = vdotq_s32(vdupq_n_s32(0), vreinterpretq_s8_u8(hi0), a2);
-            s1 = vdotq_s32(s1, vreinterpretq_s8_u8(hi1), a3);
-#else
-            int32x4_t s0 = vpaddlq_s16(vmull_s8(vget_low_s8(vreinterpretq_s8_u8(lo0)), vget_low_s8(a0)));
-            s0 = vpadalq_s16(s0, vmull_high_s8(vreinterpretq_s8_u8(lo0), a0));
-            s0 = vpadalq_s16(s0, vmull_s8(vget_low_s8(vreinterpretq_s8_u8(lo1)), vget_low_s8(a1)));
-            s0 = vpadalq_s16(s0, vmull_high_s8(vreinterpretq_s8_u8(lo1), a1));
-            int32x4_t s1 = vpaddlq_s16(vmull_s8(vget_low_s8(vreinterpretq_s8_u8(hi0)), vget_low_s8(a2)));
-            s1 = vpadalq_s16(s1, vmull_high_s8(vreinterpretq_s8_u8(hi0), a2));
-            s1 = vpadalq_s16(s1, vmull_s8(vget_low_s8(vreinterpretq_s8_u8(hi1)), vget_low_s8(a3)));
-            s1 = vpadalq_s16(s1, vmull_high_s8(vreinterpretq_s8_u8(hi1), a3));
-#endif
-            sumi = vmlaq_n_s32(sumi, s0, sc[2 * g]);
-            sumi = vmlaq_n_s32(sumi, s1, sc[2 * g + 1]);
-        }
-        int summ = 0;
-        for (int j = 0; j < 8; j++) summ += mn[j] * (y[i].bsums[2 * j] + y[i].bsums[2 * j + 1]);
-        sumf += y[i].d * (f16_to_f32(x[i].d) * (float)vaddvq_s32(sumi) - f16_to_f32(x[i].dmin) * (float)summ);
-    }
-    return sumf;
-}
-#endif /* HY_NEON (q4k) */
-
 typedef float (*q6_dot_fn)(const block_q6_k *, const q8k_block *, int);
 static q6_dot_fn g_q6_dot = q6_k_dot_scalar;
 
@@ -1278,66 +1098,6 @@ static float dot_q8_0_f32(const block_q8_0 *x, const float *y, int k) {
     }
     return sum;
 }
-
-typedef float (*q8_dot_fn)(const block_q8_0 *, const float *, int);
-static q8_dot_fn g_q8_dot = dot_q8_0_f32;
-
-#ifdef HY_X86
-/* SSE4.1: pmovsxbd 扩展 int8→int32 再转 float 点积 */
-HY_TARGET("sse4.1")
-static float dot_q8_0_sse41(const block_q8_0 *x, const float *y, int k) {
-    float sum = 0.f;
-    for (int b = 0; b < k / 32; b++) {
-        const float *yy = y + b * 32;
-        __m128 acc = _mm_setzero_ps();
-        for (int j = 0; j < 32; j += 4) {
-            __m128i q = _mm_cvtepi8_epi32(_mm_cvtsi32_si128(*(const int *)(x[b].qs + j)));
-            acc = _mm_add_ps(acc, _mm_mul_ps(_mm_cvtepi32_ps(q), _mm_loadu_ps(yy + j)));
-        }
-        float t[4];
-        _mm_storeu_ps(t, acc);
-        sum += f16_to_f32(x[b].d) * ((t[0] + t[1]) + (t[2] + t[3]));
-    }
-    return sum;
-}
-
-HY_TARGET("avx2,f16c")
-static float dot_q8_0_avx2(const block_q8_0 *x, const float *y, int k) {
-    float sum = 0.f;
-    for (int b = 0; b < k / 32; b++) {
-        const float *yy = y + b * 32;
-        __m256 acc = _mm256_setzero_ps();
-        for (int j = 0; j < 32; j += 8) {
-            __m256i q = _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(x[b].qs + j)));
-            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_cvtepi32_ps(q), _mm256_loadu_ps(yy + j)));
-        }
-        __m128 r = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
-        r = _mm_hadd_ps(r, r); r = _mm_hadd_ps(r, r);
-        sum += f16_hw(x[b].d) * _mm_cvtss_f32(r);
-    }
-    return sum;
-}
-#endif
-
-#ifdef HY_NEON
-static float dot_q8_0_neon(const block_q8_0 *x, const float *y, int k) {
-    float sum = 0.f;
-    for (int b = 0; b < k / 32; b++) {
-        const float *yy = y + b * 32;
-        float32x4_t acc = vdupq_n_f32(0);
-        for (int j = 0; j < 32; j += 16) {
-            int8x16_t q = vld1q_s8(x[b].qs + j);
-            int16x8_t q0 = vmovl_s8(vget_low_s8(q)), q1 = vmovl_high_s8(q);
-            acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_low_s16(q0))), vld1q_f32(yy + j));
-            acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_high_s16(q0)), vld1q_f32(yy + j + 4));
-            acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_low_s16(q1))), vld1q_f32(yy + j + 8));
-            acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_high_s16(q1)), vld1q_f32(yy + j + 12));
-        }
-        sum += f16_to_f32(x[b].d) * vaddvq_f32(acc);
-    }
-    return sum;
-}
-#endif
 
 /* ------------------------------------------------------------------ 注意力: bf16 KV 的点积 / axpy */
 
@@ -1506,7 +1266,7 @@ void matmul_rows(const weight_t *w, int r0, int r1, const float *xf, const q8k_b
         for (int r = r0; r < r1; r++) {
             const block_q8_0 *row = (const block_q8_0 *)(w->data + (size_t)r * w->row_bytes);
             for (int t = 0; t < nt; t++)
-                out[(size_t)t * w->n + r] = g_q8_dot(row, xf + (size_t)t * w->k, w->k);
+                out[(size_t)t * w->n + r] = dot_q8_0_f32(row, xf + (size_t)t * w->k, w->k);
         }
         return;
     case GT_F16:
@@ -1570,24 +1330,9 @@ static void sign_lut_init(void) {
     }
 }
 
-/* ISA 等级: x86: 0 scalar < 1 ssse3 < 2 sse4.1 (J4125) < 3 avx2 < 4 avx512
- *          arm: 0 scalar < 1 neon < 2 neon+dotprod */
+/* ISA 等级: 0 scalar < 1 ssse3 < 2 sse4.1 (SSE4.2 机器如 J4125 用它) < 3 avx2 < 4 avx512 */
 static int g_level = 0;
 static bool g_cb_ok = true;
-
-#ifdef HY_NEON
-static int hy_arm_has_dotprod(void) {
-#if defined(__APPLE__)
-    return 1; /* Apple Silicon 均有 DOTPROD */
-#elif defined(__linux__) || defined(__ANDROID__)
-    return (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
-#elif defined(__ARM_FEATURE_DOTPROD)
-    return 1;
-#else
-    return 0;
-#endif
-}
-#endif
 
 static int isa_level_by_name(const char *name) {
     if (!strcmp(name, "scalar")) return 0;
@@ -1596,8 +1341,7 @@ static int isa_level_by_name(const char *name) {
     if (!strcmp(name, "avx2")) return 3;
     if (!strncmp(name, "avx512", 6)) return 4; /* "avx512" / "avx512-bw" (强制不用 VNNI) / "avx512-vnni" */
 #ifdef HY_NEON
-    if (!strcmp(name, "neon+dotprod") || !strcmp(name, "dotprod")) return 2;
-    if (!strcmp(name, "neon")) return 1;
+    if (!strncmp(name, "neon", 4)) return 1;
 #endif
     return -1;
 }
@@ -1608,7 +1352,7 @@ bool kernels_set_isa(const char *name) {
     sign_lut_init();
     g_stq_rows = stq_rows_scalar; g_q6_dot = q6_k_dot_scalar; g_isa = "scalar"; g_level = 0;
     g_dot_bf16 = dot_bf16_scalar; g_axpy_bf16 = axpy_bf16_scalar; g_panel_rows = panel_rows_scalar;
-    g_q4k_dot = q4_k_dot_scalar; g_q8_dot = dot_q8_0_f32;
+    g_q4k_dot = q4_k_dot_scalar;
     const bool want_auto = (name == NULL || !strcmp(name, "auto"));
     int max_level = 99;
     if (!want_auto) {
@@ -1625,12 +1369,11 @@ bool kernels_set_isa(const char *name) {
     if (max_level >= 2 && HY_CPU_SUPPORTS("sse4.1")) {
         g_stq_rows = stq_rows_sse41; g_q6_dot = q6_k_dot_sse41; g_isa = "sse4.1"; g_level = 2;
         g_dot_bf16 = dot_bf16_sse2; g_axpy_bf16 = axpy_bf16_sse2;
-        g_q8_dot = dot_q8_0_sse41;
     }
     if (max_level >= 3 && HY_CPU_SUPPORTS("avx2") && HY_CPU_SUPPORTS("f16c")) {
         g_stq_rows = stq_rows_avx2; g_q6_dot = q6_k_dot_avx2; g_isa = "avx2"; g_level = 3;
         g_dot_bf16 = dot_bf16_avx2; g_axpy_bf16 = axpy_bf16_avx2; g_panel_rows = panel_rows_avx2;
-        g_q4k_dot = q4_k_dot_avx2; g_q8_dot = dot_q8_0_avx2;
+        g_q4k_dot = q4_k_dot_avx2;
     }
     /* AVX-512: 显式指定 (HYMT2_ISA=avx512) 时只要 CPU 支持就用; auto 时仅在有 VNNI 的较新核心上启用
      * (没有 VNNI 的 Skylake-X 类核心跑 512 位指令会降频, 收益不稳, 需要的话手动指定) */
@@ -1649,16 +1392,12 @@ bool kernels_set_isa(const char *name) {
     if (max_level >= 1) {
         g_stq_rows = stq_rows_neon; g_q6_dot = q6_k_dot_neon;
         g_dot_bf16 = dot_bf16_neon; g_axpy_bf16 = axpy_bf16_neon; g_panel_rows = panel_rows_neon;
-        g_q4k_dot = q4_k_dot_neon; g_q8_dot = dot_q8_0_neon;
-        g_isa = "neon";
         g_level = 1;
-    }
-    /* 与官方 llama.cpp STQ 一致: 有 ASIMDDP 时用 vdot (面板/原生 STQ)。不碰 x86/J4125 路径。 */
-    if (max_level >= 2 && hy_arm_has_dotprod()) {
-        g_stq_rows = stq_rows_neon_dotprod;
-        g_panel_rows = panel_rows_neon_dotprod;
+#ifdef __ARM_FEATURE_DOTPROD
         g_isa = "neon+dotprod";
-        g_level = 2;
+#else
+        g_isa = "neon";
+#endif
     }
 #endif
     if (want_auto) return true;
@@ -1692,7 +1431,9 @@ const char *kernels_cpu_features(void) {
 #undef FEAT
 #elif defined(HY_NEON)
     strcpy(buf, "neon");
-    if (hy_arm_has_dotprod()) strcat(buf, " dotprod");
+#ifdef __ARM_FEATURE_DOTPROD
+    strcat(buf, " dotprod");
+#endif
 #endif
     return buf[0] ? buf : "(unknown)";
 }
