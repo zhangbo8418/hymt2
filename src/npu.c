@@ -11,6 +11,12 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#endif
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
 static void *hy_dlopen(const char *n) { return (void *)LoadLibraryA(n); }
 static void *hy_dlsym(void *h, const char *n) { return (void *)GetProcAddress((HMODULE)h, n); }
 static void hy_dlclose(void *h) { if (h) FreeLibrary((HMODULE)h); }
@@ -24,13 +30,23 @@ static void hy_dlclose(void *h) { if (h) dlclose(h); }
 
 static int file_ok(const char *p) {
     if (!p || !*p) return 0;
+#if defined(_WIN32)
+    DWORD a = GetFileAttributesA(p);
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+#else
     struct stat st;
     return stat(p, &st) == 0 && S_ISREG(st.st_mode);
+#endif
 }
 static int dir_ok(const char *p) {
     if (!p || !*p) return 0;
+#if defined(_WIN32)
+    DWORD a = GetFileAttributesA(p);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+#else
     struct stat st;
     return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
 }
 
 /* 相对本仓库 third_party/sdks：可执行文件旁、或 HYMT2_SDK_ROOT / 源码布局。 */

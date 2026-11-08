@@ -61,7 +61,11 @@ int main(int argc, char **argv) {
     const int threads = argc > 4 ? atoi(argv[4]) : 0, max_tokens = argc > 5 ? atoi(argv[5]) : 128;
     const char *runs_env = getenv("HYMT2_CLI_RUNS");
     const int runs = runs_env && atoi(runs_env) > 0 ? atoi(runs_env) : 2;
+#if defined(_WIN32)
+    char *text = argv[3][0] == '@' ? read_file(argv[3] + 1) : _strdup(argv[3]);
+#else
     char *text = argv[3][0] == '@' ? read_file(argv[3] + 1) : strdup(argv[3]);
+#endif
     if (!text) { fprintf(stderr, "cannot read %s\n", argv[3] + 1); return 2; }
 
     double t0 = ms();
