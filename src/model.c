@@ -49,7 +49,8 @@ struct hymt2_model {
     /* 加速设备 (Vulkan / CUDA / Metal / NPU, 经 device.h) */
     hy_device *dev;
     bool use_gpu;
-    bool use_fused; /* Metal/CUDA 整网常驻前向 */
+    bool use_fused; /* Metal/CUDA: 仅整网常驻前向; 不用「逐 matmul+CPU 注意力」假加速 */
+    hy_fused_layer *fused_layers; /* prepare 后常驻, forward 不再每步 calloc */
     hy_dweight **gpu_ws;
     int n_gpu, cap_gpu;
     /* 最近一次 generate 的统计 */
@@ -184,6 +185,7 @@ void hymt2_model_free(hymt2_model *m) {
     free(m->scores); free(m->logits); hy_aligned_free(m->xq_h); hy_aligned_free(m->xq_q); hy_aligned_free(m->xq_f);
     for (int i = 0; i < m->n_gpu; i++) hy_device_release_on(m->dev, m->gpu_ws[i]);
     free(m->gpu_ws);
+    free(m->fused_layers);
     hy_device_destroy(m->dev);
     for (int i = 0; i < m->n_panel; i++) { hy_aligned_free(m->panel_pk[i]); free(m->panel_ps[i]); }
     free(m->panel_pk); free(m->panel_ps);
@@ -277,6 +279,8 @@ static void gpu_register(hymt2_model *m, weight_t *w, hy_dweight *g) {
 static void gpu_drop(hymt2_model *m) {
     m->use_gpu = false;
     m->use_fused = false;
+    free(m->fused_layers);
+    m->fused_layers = NULL;
     for (int i = 0; i < m->n_gpu; i++) hy_device_release_on(m->dev, m->gpu_ws[i]);
     m->n_gpu = 0;
     for (int l = 0; l < m->n_layer; l++) {
@@ -288,10 +292,9 @@ static void gpu_drop(hymt2_model *m) {
     m->dev = NULL;
 }
 
-static bool try_fused_prepare(hymt2_model *m, bool verbose) {
-    if (!m->use_gpu || !m->dev || !hy_device_has_fused(m->dev) || !m->outw.gpu) return false;
+static hy_fused_layer *build_fused_layers(hymt2_model *m) {
     hy_fused_layer *fl = (hy_fused_layer *)calloc((size_t)m->n_layer, sizeof(hy_fused_layer));
-    if (!fl) return false;
+    if (!fl) return NULL;
     for (int i = 0; i < m->n_layer; i++) {
         fl[i].wq = (hy_dweight *)m->L[i].wq.gpu; fl[i].wk = (hy_dweight *)m->L[i].wk.gpu;
         fl[i].wv = (hy_dweight *)m->L[i].wv.gpu; fl[i].wo = (hy_dweight *)m->L[i].wo.gpu;
@@ -300,55 +303,69 @@ static bool try_fused_prepare(hymt2_model *m, bool verbose) {
         fl[i].attn_norm = m->L[i].attn_norm; fl[i].ffn_norm = m->L[i].ffn_norm;
         fl[i].q_norm = m->L[i].q_norm; fl[i].k_norm = m->L[i].k_norm;
         if (!fl[i].wq || !fl[i].wk || !fl[i].wv || !fl[i].wo || !fl[i].wg || !fl[i].wu || !fl[i].wd) {
-            free(fl); return false;
+            free(fl); return NULL;
         }
     }
-    hy_fused_args sh = {0};
-    sh.n_layer = m->n_layer; sh.hidden = m->hidden; sh.ffn = m->ffn;
-    sh.heads = m->heads; sh.kv_heads = m->kv_heads; sh.hdim = m->hdim;
-    sh.qdim = m->qdim; sh.kvdim = m->kvdim; sh.ctx = m->ctx; sh.rope_half = m->rope_half;
-    sh.eps = m->eps; sh.layers = fl; sh.outw = (hy_dweight *)m->outw.gpu;
-    sh.out_norm = m->out_norm; sh.rope_cos = m->rope_cos; sh.rope_sin = m->rope_sin;
-    bool ok = hy_device_fused_prepare(m->dev, &sh);
-    if (!ok) { free(fl); return false; }
-    /* 校准: fused 整网一次 vs CPU 同规模; 不够快则保持逐 matmul GPU/CPU */
+    return fl;
+}
+
+static void fill_fused_shape(hymt2_model *m, hy_fused_args *sh, hy_fused_layer *fl) {
+    memset(sh, 0, sizeof(*sh));
+    sh->n_layer = m->n_layer; sh->hidden = m->hidden; sh->ffn = m->ffn;
+    sh->heads = m->heads; sh->kv_heads = m->kv_heads; sh->hdim = m->hdim;
+    sh->qdim = m->qdim; sh->kvdim = m->kvdim; sh->ctx = m->ctx; sh->rope_half = m->rope_half;
+    sh->eps = m->eps; sh->layers = fl; sh->outw = (hy_dweight *)m->outw.gpu;
+    sh->out_norm = m->out_norm; sh->rope_cos = m->rope_cos; sh->rope_sin = m->rope_sin;
+}
+
+/* CUDA/Metal: 只认整网 fused（权重/激活/KV 常驻, ≤1 sync）。
+ * 旧改法「逐 matmul GPU + CPU 注意力」来回拷, 常慢于物理核 CPU, 且 fused 失败后仍留下 use_gpu=true。 */
+static bool enable_fused(hymt2_model *m, bool verbose) {
+    if (!m->dev || !hy_device_has_fused(m->dev) || !m->outw.gpu) return false;
     const char *fe = getenv("HYMT2_FUSED");
     int force = fe && (!strcmp(fe, "1") || !strcmp(fe, "force") || !strcmp(fe, "yes") || !strcmp(fe, "on"));
     int forbid = fe && (!strcmp(fe, "0") || !strcmp(fe, "off") || !strcmp(fe, "no"));
-    if (forbid) { free(fl); m->use_fused = false; return false; }
+    if (forbid) return false;
+
+    hy_fused_layer *fl = build_fused_layers(m);
+    if (!fl) return false;
+    hy_fused_args sh;
+    fill_fused_shape(m, &sh, fl);
+    if (!hy_device_fused_prepare(m->dev, &sh)) { free(fl); return false; }
+
     if (!force) {
         for (int i = 0; i < m->hidden; i++) m->h[i] = 0.01f * (float)((i * 17) % 100);
-        int toks[1] = { 1 };
         hy_fused_args a = sh;
-        a.layers = fl; a.nt = 1; a.pos0 = 0; a.want_logits = 1; a.h = m->h; a.logits = m->logits;
+        a.nt = 1; a.pos0 = 0; a.want_logits = 1; a.h = m->h; a.logits = m->logits;
         double t0 = now_ms();
         for (int r = 0; r < 2; r++) {
-            if (!hy_device_fused_forward(m->dev, &a)) { free(fl); m->use_fused = false; return false; }
+            if (!hy_device_fused_forward(m->dev, &a)) { free(fl); return false; }
         }
         double fused_ms = (now_ms() - t0) / 2.0;
-        m->use_fused = false;
-        bool was_gpu = m->use_gpu;
         m->use_gpu = false;
+        m->use_fused = false;
         double t1 = now_ms();
-        forward_batch(m, toks, 1, 0, true);
+        int _tok1 = 1; forward_batch(m, &_tok1, 1, 0, true);
         double cpu_ms = now_ms() - t1;
-        m->use_gpu = was_gpu;
         if (fused_ms > cpu_ms * 0.9) {
-            if (verbose)
-                fprintf(stderr, "[hymt2] fused 校准 %.1f ms/步 vs CPU %.1f ms — 仍用逐算子路径 (HYMT2_FUSED=1 可强制)\n",
-                        fused_ms, cpu_ms);
+            fprintf(stderr, "[hymt2] fused 校准 %.1f ms/步 vs CPU %.1f ms — 不用 %s (HYMT2_FUSED=1 可强制)\n",
+                    fused_ms, cpu_ms, hy_device_name(m->dev));
             free(fl);
             return false;
         }
-        if (verbose) fprintf(stderr, "[hymt2] fused 校准 %.1f ms/步 vs CPU %.1f ms — 启用\n", fused_ms, cpu_ms);
+        fprintf(stderr, "[hymt2] fused 校准 %.1f ms/步 vs CPU %.1f ms — 启用 %s\n",
+                fused_ms, cpu_ms, hy_device_name(m->dev));
     }
-    free(fl);
+
+    free(m->fused_layers);
+    m->fused_layers = fl;
+    m->use_gpu = true;
     m->use_fused = true;
-    if (verbose) fprintf(stderr, "[hymt2] %s 整网常驻前向已启用 (每网一次 sync)\n", hy_device_name(m->dev));
+    if (verbose) fprintf(stderr, "[hymt2] %s 整网常驻前向已启用 (≤1 sync/步)\n", hy_device_name(m->dev));
     return true;
 }
 
-/* 为当前 m->dev 建面板、上传权重; 失败则 gpu_drop 并返回 false */
+/* 上传权重; 不擅自 use_gpu=true (由 fused / matmul 校准决定)。 */
 static bool device_upload_all(hymt2_model *m, bool verbose, bool forced) {
     for (int l = 0; l < m->n_layer; l++) {
         weight_t *ws[7] = { &m->L[l].wq, &m->L[l].wk, &m->L[l].wv, &m->L[l].wo, &m->L[l].wg, &m->L[l].wu, &m->L[l].wd };
@@ -369,14 +386,12 @@ static bool device_upload_all(hymt2_model *m, bool verbose, bool forced) {
     }
     hy_dweight *gh = hy_device_upload(m->dev, &m->outw);
     if (gh) gpu_register(m, &m->outw, gh);
-    m->use_gpu = true;
     if (verbose) fprintf(stderr, "[hymt2] %s 权重上传完成 (%d 张, %.1f s)\n", hy_device_name(m->dev), m->n_gpu, (now_ms() - t0) / 1000.0);
-    try_fused_prepare(m, verbose);
     return true;
 }
 
-/* 在已上传的设备上跑 FFN 校准, 返回每层 ms; 失败返回 1e30 */
-static double device_calibrate_ms(hymt2_model *m) {
+/* Vulkan/NPU 等无 fused: 只校 FFN matmul; 必须明显快于 CPU 才启用逐算子路径。 */
+static double device_matmul_calibrate_ms(hymt2_model *m) {
     const int ncal = m->n_layer < 4 ? m->n_layer : 4;
     uint32_t s = 777;
     for (int i = 0; i < m->hidden; i++) { s = s * 1664525u + 1013904223u; m->xn[i] = ((float)(s >> 9) / 4194304.f) - 1.f; }
@@ -386,6 +401,7 @@ static double device_calibrate_ms(hymt2_model *m) {
     double best = 1e30;
     for (int rep = 0; rep < 4; rep++) {
         m->use_gpu = true;
+        m->use_fused = false;
         double t1 = now_ms();
         for (int l = 0; l < ncal; l++) {
             const weight_t *gu[2] = { &m->L[l].wg, &m->L[l].wu };
@@ -410,6 +426,7 @@ static double cpu_calibrate_ms(hymt2_model *m) {
     double best = 1e30;
     for (int rep = 0; rep < 4; rep++) {
         m->use_gpu = false;
+        m->use_fused = false;
         double t1 = now_ms();
         for (int l = 0; l < ncal; l++) {
             const weight_t *gu[2] = { &m->L[l].wg, &m->L[l].wu };
@@ -424,7 +441,7 @@ static double cpu_calibrate_ms(hymt2_model *m) {
 }
 
 /* HYMT2_DEVICE: auto|cpu|cuda|metal|vulkan|nnapi|qnn|rkllm|hiai|npu|force|<n>
- * auto: 按 cuda>metal>vulkan>qnn>nnapi>rkllm>hiai 顺序试用, 第一个比 CPU 快 ≥10% 的胜出。 */
+ * auto: cuda/metal 必须整网 fused 赢 CPU ≥10%; vulkan/npu 用 matmul 校准。输了就彻底放下, 不留假加速。 */
 static void setup_device(hymt2_model *m) {
     const char *pref = getenv("HYMT2_DEVICE");
     if (!pref || !*pref) pref = getenv("HYMT2_VK");
@@ -440,7 +457,18 @@ static void setup_device(hymt2_model *m) {
         m->dev = hy_device_create(pref, info, sizeof info);
         if (!m->dev) { fprintf(stderr, "[hymt2] 加速设备不可用: %s\n", info); return; }
         fprintf(stderr, "[hymt2] 设备(强制): %s (%s)\n", hy_device_name(m->dev), info);
-        device_upload_all(m, verbose, true);
+        if (!device_upload_all(m, verbose, true)) return;
+        if (hy_device_has_fused(m->dev)) {
+            if (!enable_fused(m, verbose)) {
+                /* 强制设备但 fused 不够快: 仍开逐算子, 便于调试; 日志已提示 */
+                m->use_gpu = true;
+                m->use_fused = false;
+                fprintf(stderr, "[hymt2] 强制 %s: fused 未胜出, 回退逐算子 (可能慢于 CPU)\n", hy_device_name(m->dev));
+            }
+        } else {
+            m->use_gpu = true;
+            m->use_fused = false;
+        }
         return;
     }
 
@@ -456,17 +484,30 @@ static void setup_device(hymt2_model *m) {
         if (m->dev) gpu_drop(m);
         m->dev = d;
         if (!device_upload_all(m, verbose, false)) continue;
-        double ms = device_calibrate_ms(m);
-        fprintf(stderr, "[hymt2] 校准 %s: %.2f ms/层 (CPU %.2f)\n", hy_device_name(d), ms, cpu_ms);
+
+        if (hy_device_has_fused(m->dev)) {
+            if (enable_fused(m, verbose)) {
+                fprintf(stderr, "[hymt2] auto -> %s+fused (%s)\n", hy_device_name(d), info);
+                return;
+            }
+            fprintf(stderr, "[hymt2] %s fused 未优于 CPU, 继续\n", hy_device_name(d));
+            gpu_drop(m);
+            continue;
+        }
+
+        double ms = device_matmul_calibrate_ms(m);
+        fprintf(stderr, "[hymt2] 校准 %s matmul: %.2f ms/层 (CPU %.2f)\n", hy_device_name(d), ms, cpu_ms);
         if (ms < cpu_ms * 0.9) {
-            fprintf(stderr, "[hymt2] auto -> %s (%.2f ms/层 < CPU %.2f×0.9; %s)\n",
+            m->use_gpu = true;
+            m->use_fused = false;
+            fprintf(stderr, "[hymt2] auto -> %s (matmul %.2f < CPU %.2f×0.9; %s)\n",
                     hy_device_name(d), ms, cpu_ms, info);
             return;
         }
         fprintf(stderr, "[hymt2] %s 未优于 CPU, 继续\n", hy_device_name(d));
         gpu_drop(m);
     }
-    fprintf(stderr, "[hymt2] auto -> cpu (无设备快过 CPU 10%%; CPU %.2f ms/层)\n", cpu_ms);
+    fprintf(stderr, "[hymt2] auto -> cpu (无设备快过物理核 CPU 10%%; CPU %.2f ms/层)\n", cpu_ms);
 }
 
 hymt2_model *hymt2_model_load(const char *path, int n_threads, int ctx_len, char *err, int err_cap) {
@@ -764,31 +805,17 @@ static void forward_batch(hymt2_model *m, const int *toks, int nt, int pos0, boo
     for (int t = 0; t < nt; t++) dequant_row(&m->embd, toks[t], m->h + (size_t)t * H);
     PROF_END(0);
 
-    if (m->use_fused && m->use_gpu && m->dev) {
-        hy_fused_layer *fl = (hy_fused_layer *)calloc((size_t)m->n_layer, sizeof(hy_fused_layer));
-        if (fl) {
-            for (int i = 0; i < m->n_layer; i++) {
-                fl[i].wq = (hy_dweight *)m->L[i].wq.gpu; fl[i].wk = (hy_dweight *)m->L[i].wk.gpu;
-                fl[i].wv = (hy_dweight *)m->L[i].wv.gpu; fl[i].wo = (hy_dweight *)m->L[i].wo.gpu;
-                fl[i].wg = (hy_dweight *)m->L[i].wg.gpu; fl[i].wu = (hy_dweight *)m->L[i].wu.gpu;
-                fl[i].wd = (hy_dweight *)m->L[i].wd.gpu;
-                fl[i].attn_norm = m->L[i].attn_norm; fl[i].ffn_norm = m->L[i].ffn_norm;
-                fl[i].q_norm = m->L[i].q_norm; fl[i].k_norm = m->L[i].k_norm;
-            }
-            hy_fused_args a = {0};
-            a.n_layer = m->n_layer; a.hidden = m->hidden; a.ffn = m->ffn;
-            a.heads = m->heads; a.kv_heads = m->kv_heads; a.hdim = m->hdim;
-            a.qdim = m->qdim; a.kvdim = m->kvdim; a.ctx = m->ctx; a.rope_half = m->rope_half;
-            a.eps = m->eps; a.nt = nt; a.pos0 = pos0; a.want_logits = want_logits ? 1 : 0;
-            a.layers = fl; a.outw = (hy_dweight *)m->outw.gpu;
-            a.out_norm = m->out_norm; a.rope_cos = m->rope_cos; a.rope_sin = m->rope_sin;
-            a.h = m->h; a.logits = m->logits;
-            bool ok = hy_device_fused_forward(m->dev, &a);
-            free(fl);
-            if (ok) { PROF_END(6); return; }
-            m->use_fused = false; /* 回退逐算子 GPU/CPU; KV 不同步时清缓存由上层处理 */
-            m->n_cache = 0;
-        }
+    if (m->use_fused && m->use_gpu && m->dev && m->fused_layers) {
+        hy_fused_args a;
+        fill_fused_shape(m, &a, m->fused_layers);
+        a.nt = nt; a.pos0 = pos0; a.want_logits = want_logits ? 1 : 0;
+        a.h = m->h; a.logits = m->logits;
+        if (hy_device_fused_forward(m->dev, &a)) { PROF_END(6); return; }
+        /* fused 运行失败: 彻底回退纯 CPU, 不留逐算子 GPU 假加速 */
+        fprintf(stderr, "[hymt2] fused forward 失败, 回退 CPU\n");
+        m->use_fused = false;
+        m->use_gpu = false;
+        m->n_cache = 0;
     }
 
     /* 纯 CPU: 走原始 zip 同款直写缓冲路径 (无 gpu_out 间接), 避免 23→16 tok/s 回归。
