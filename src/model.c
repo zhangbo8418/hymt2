@@ -159,28 +159,14 @@ static float *load_vec(hymt2_model *m, const char *name, int n) {
 static int default_threads(void) {
     const char *e = getenv("HYMT2_THREADS");
     if (e && atoi(e) > 0) return atoi(e);
-    /* 恢复与原始 zip 一致: 默认用逻辑核并封顶 8。
-     * 曾改成物理核后, 4c/8t 机器从 8→4 线程, decode 从 ~23 掉到 ~16 tok/s。
-     * Android 仍用物理核并封顶 4 (端侧 LLC/总线争用更明显)。 */
-    long n = 1;
-#ifdef _WIN32
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    n = (long)si.dwNumberOfProcessors;
-#else
-    n = sysconf(_SC_NPROCESSORS_ONLN);
-#endif
-#if defined(__ANDROID__)
-    {
-        int phys = hy_physical_cpu_count();
-        if (phys > 0) n = phys;
-        if (n > 4) n = 4;
-    }
-#else
-    if (n > 8) n = 8;
-#endif
+    /* 默认绑定物理核 (不含超线程逻辑核); 争用同一执行单元时逻辑核并行常更慢。
+     * 可用 HYMT2_THREADS 覆盖。Android 额外封顶 4。 */
+    int n = hy_physical_cpu_count();
     if (n < 1) n = 1;
-    return (int)n;
+#if defined(__ANDROID__)
+    if (n > 4) n = 4;
+#endif
+    return n;
 }
 
 void hymt2_model_free(hymt2_model *m) {
