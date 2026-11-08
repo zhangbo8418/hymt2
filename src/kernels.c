@@ -8,21 +8,25 @@
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
 #define HY_X86 1
 #include <immintrin.h>
+/* clang-cl 支持 target 多版本; 但 Windows 上 __builtin_cpu_supports 要链 clang_rt,
+ * 用 link.exe 会 LNK2019, 故 Win 一律 CPUID。 */
 #if defined(__GNUC__) || defined(__clang__)
 #define HY_TARGET(...) __attribute__((target(__VA_ARGS__)))
+#else
+#define HY_TARGET(...)
+#endif
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
 #define HY_CPU_INIT() __builtin_cpu_init()
 #define HY_CPU_SUPPORTS(feat) __builtin_cpu_supports(feat)
 #else
-/* MSVC: no function multiversion; CPUID dispatch picks compiled intrinsic paths. */
-#define HY_TARGET(...)
 #include <intrin.h>
 static int hy_cpu_bit(int leaf, int sub, int reg, int bit) {
     int info[4] = {0, 0, 0, 0};
     __cpuidex(info, leaf, sub);
     return (info[reg] >> bit) & 1;
 }
-static void hy_cpu_init_msvc(void) { (void)0; }
-static int hy_cpu_supports_msvc(const char *feat) {
+static void hy_cpu_init_win(void) { (void)0; }
+static int hy_cpu_supports_win(const char *feat) {
     if (!strcmp(feat, "ssse3")) return hy_cpu_bit(1, 0, 2, 9);
     if (!strcmp(feat, "sse4.1")) return hy_cpu_bit(1, 0, 2, 19);
     if (!strcmp(feat, "sse4.2")) return hy_cpu_bit(1, 0, 2, 20);
@@ -37,8 +41,8 @@ static int hy_cpu_supports_msvc(const char *feat) {
     if (!strcmp(feat, "avx512vnni")) return hy_cpu_bit(7, 0, 2, 11); /* ECX bit 11 */
     return 0;
 }
-#define HY_CPU_INIT() hy_cpu_init_msvc()
-#define HY_CPU_SUPPORTS(feat) hy_cpu_supports_msvc(feat)
+#define HY_CPU_INIT() hy_cpu_init_win()
+#define HY_CPU_SUPPORTS(feat) hy_cpu_supports_win(feat)
 #endif
 #endif
 #if defined(__aarch64__)
