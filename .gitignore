@@ -1,0 +1,25 @@
+# build
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+hymt2_cli
+hymt2_cli_static
+test_kernels
+bench_kernels
+libhymt2.*
+build/
+build_msvc/
+android-arm64/
+.DS_Store
+
+# huge optional SDKs (fetch with scripts/fetch_sdks.sh)
+third_party/sdks/
+
+# local models / prebuilt
+*.gguf
+prebuilt/

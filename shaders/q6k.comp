@@ -1,0 +1,51 @@
+#version 450
+// Q6_K 矩阵乘; 上传时每块从 210 B 补到 212 B (53 uint) 以保证 4 字节对齐: ql @0, qh @32(uint), scales @48, d @52
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer W { uint wq[]; };
+layout(std430, binding = 1) readonly buffer S { float unused_s[]; };
+layout(std430, binding = 2) readonly buffer A { uint act[]; };
+layout(std430, binding = 3) buffer O { float outv[]; };
+layout(push_constant) uniform P { uint rows, nb, nt, n_total, row0, shift, off, pad0; } pc;
+shared float red[64];
+
+uint wbyte(uint base, uint i) { return (wq[base + (i >> 2)] >> (8u * (i & 3u))) & 255u; }
+int abyte(uint base, uint i) { return bitfieldExtract(int(act[base + (i >> 2)]), int(8u * (i & 3u)), 8); }
+
+void main() {
+    uint lr = gl_LocalInvocationID.x >> 3, lane = gl_LocalInvocationID.x & 7u;
+    uint r = gl_WorkGroupID.x * 8u + lr;
+    uint t = gl_WorkGroupID.y;
+    float acc = 0.0;
+    if (r < pc.rows) {
+        for (uint b = lane; b < pc.nb; b += 8u) {
+            uint wb = (r * pc.nb + b) * 53u;
+            uint ab = (t * pc.nb + b) * 144u;
+            int isum = 0;
+            for (uint n = 0u; n < 2u; n++) {
+                for (uint l = 0u; l < 32u; l++) {
+                    uint qlo = wbyte(wb, 64u * n + l), qhi = wbyte(wb, 64u * n + l + 32u);
+                    uint qh = wbyte(wb + 32u, 32u * n + l);
+                    int q1 = int((qlo & 15u) | (((qh >> 0) & 3u) << 4)) - 32;
+                    int q2 = int((qhi & 15u) | (((qh >> 2) & 3u) << 4)) - 32;
+                    int q3 = int((qlo >> 4) | (((qh >> 4) & 3u) << 4)) - 32;
+                    int q4 = int((qhi >> 4) | (((qh >> 6) & 3u) << 4)) - 32;
+                    uint e = 128u * n + l;
+                    isum += bitfieldExtract(int(wbyte(wb + 48u, e / 16u) << 24u), 24, 8) * q1 * abyte(ab + 80u, e)
+                          + bitfieldExtract(int(wbyte(wb + 48u, (e + 32u) / 16u) << 24u), 24, 8) * q2 * abyte(ab + 80u, e + 32u)
+                          + bitfieldExtract(int(wbyte(wb + 48u, (e + 64u) / 16u) << 24u), 24, 8) * q3 * abyte(ab + 80u, e + 64u)
+                          + bitfieldExtract(int(wbyte(wb + 48u, (e + 96u) / 16u) << 24u), 24, 8) * q4 * abyte(ab + 80u, e + 96u);
+                }
+            }
+            float d = unpackHalf2x16(wq[wb + 52u]).x;
+            float yd = uintBitsToFloat(act[ab + 64u]);
+            acc += d * yd * float(isum);
+        }
+    }
+    red[gl_LocalInvocationID.x] = acc;
+    barrier();
+    if (lane == 0u && r < pc.rows) {
+        float s = 0.0;
+        for (uint i = 0u; i < 8u; i++) s += red[lr * 8u + i];
+        outv[t * pc.n_total + pc.row0 + r] = s;
+    }
+}

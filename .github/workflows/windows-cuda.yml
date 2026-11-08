@@ -1,0 +1,83 @@
+# Build Win64 hymt2 with CUDA fused on GitHub Actions.
+# Artifact targets Win7+ when built with CUDA 10.2 (subsystem 6.1).
+name: windows-cuda
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src/**'
+      - 'tools/**'
+      - 'include/**'
+      - 'Makefile'
+      - 'CMakeLists.txt'
+      - '.github/workflows/windows-cuda.yml'
+      - 'scripts/ci_build_win_cuda.bat'
+
+permissions:
+  contents: read
+
+jobs:
+  cuda102-win7:
+    name: CUDA 10.2 (Win7-compatible)
+    runs-on: windows-2019
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC (VS2019 on windows-2019)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install CUDA 10.2
+        uses: Jimver/cuda-toolkit@v0.2.23
+        id: cuda
+        with:
+          cuda: '10.2.89'
+          method: network
+          sub-packages: '["nvcc","cudart","visual_studio_integration"]'
+          use-github-cache: true
+
+      - name: Build
+        shell: cmd
+        run: scripts\ci_build_win_cuda.bat
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hymt2-win7-cuda102
+          path: |
+            hymt2_cli.exe
+            cudart64_102.dll
+          if-no-files-found: error
+
+  cuda12-win10:
+    name: CUDA 12.x (Win10+)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install CUDA 12.4
+        uses: Jimver/cuda-toolkit@v0.2.23
+        with:
+          cuda: '12.4.0'
+          method: network
+          use-github-cache: true
+
+      - name: Build
+        shell: cmd
+        run: scripts\ci_build_win_cuda.bat
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hymt2-win10-cuda12
+          path: |
+            hymt2_cli.exe
+            cudart64_*.dll
+          if-no-files-found: error

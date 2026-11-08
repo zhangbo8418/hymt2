@@ -1,0 +1,59 @@
+#version 450
+// Q4_K 矩阵乘 (标准 ggml 布局, 144 B = 36 uint / 块)
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer W { uint wq[]; };
+layout(std430, binding = 1) readonly buffer S { float unused_s[]; };
+layout(std430, binding = 2) readonly buffer A { uint act[]; };   // q8k_block 144 uint: qs[256] @80 (字节 320), bsums @66, d @64
+layout(std430, binding = 3) buffer O { float outv[]; };
+layout(push_constant) uniform P { uint rows, nb, nt, n_total, row0, shift, off, pad0; } pc;
+shared float red[64];
+
+uint wbyte(uint base, uint i) { return (wq[base + (i >> 2)] >> (8u * (i & 3u))) & 255u; }
+int abyte(uint base, uint i) { return bitfieldExtract(int(act[base + (i >> 2)]), int(8u * (i & 3u)), 8); }
+
+void main() {
+    uint lr = gl_LocalInvocationID.x >> 3, lane = gl_LocalInvocationID.x & 7u;
+    uint r = gl_WorkGroupID.x * 8u + lr;
+    uint t = gl_WorkGroupID.y;
+    float acc = 0.0;
+    if (r < pc.rows) {
+        for (uint b = lane; b < pc.nb; b += 8u) {
+            uint wb = (r * pc.nb + b) * 36u;
+            uint ab = (t * pc.nb + b) * 144u;
+            vec2 dd = unpackHalf2x16(wq[wb]);
+            // 6-bit scales / mins (get_scale_min_k4), scales 字节在 wq[wb+1 .. wb+3]
+            uint sc[8], mn[8];
+            for (uint j = 0u; j < 8u; j++) {
+                if (j < 4u) { sc[j] = wbyte(wb + 1u, j) & 63u; mn[j] = wbyte(wb + 1u, j + 4u) & 63u; }
+                else {
+                    sc[j] = (wbyte(wb + 1u, j + 4u) & 15u) | ((wbyte(wb + 1u, j - 4u) >> 6) << 4);
+                    mn[j] = (wbyte(wb + 1u, j + 4u) >> 4) | ((wbyte(wb + 1u, j) >> 6) << 4);
+                }
+            }
+            int sumi = 0;
+            for (uint g = 0u; g < 4u; g++) {
+                int s0 = 0, s1 = 0;
+                for (uint l = 0u; l < 32u; l++) {
+                    uint q = wbyte(wb + 4u, 32u * g + l);
+                    s0 += int(q & 15u) * abyte(ab + 80u, 64u * g + l);
+                    s1 += int(q >> 4) * abyte(ab + 80u, 64u * g + 32u + l);
+                }
+                sumi += int(sc[2u * g]) * s0 + int(sc[2u * g + 1u]) * s1;
+            }
+            int summ = 0;
+            for (uint j = 0u; j < 8u; j++) {
+                uint w = act[ab + 66u + j];   // bsums[2j], bsums[2j+1] 打包在同一个 uint
+                summ += int(mn[j]) * (bitfieldExtract(int(w), 0, 16) + bitfieldExtract(int(w), 16, 16));
+            }
+            float yd = uintBitsToFloat(act[ab + 64u]);
+            acc += yd * (dd.x * float(sumi) - dd.y * float(summ));
+        }
+    }
+    red[gl_LocalInvocationID.x] = acc;
+    barrier();
+    if (lane == 0u && r < pc.rows) {
+        float s = 0.0;
+        for (uint i = 0u; i < 8u; i++) s += red[lr * 8u + i];
+        outv[t * pc.n_total + pc.row0 + r] = s;
+    }
+}

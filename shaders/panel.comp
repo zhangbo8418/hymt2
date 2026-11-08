@@ -1,0 +1,46 @@
+#version 450
+// STQ1_0 / Q2_0C 面板矩阵乘: 64 个线程 = 8 行 × 每行 8 条 lane; 一条 lane 处理一个 256 权重块 (64 字节面板 + Q8_K 激活块)
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer W { uint pk[]; };    // 行 r 块 b: 16 个 uint, 偏移 (r*nb+b)*16; 每字节 4 个 2-bit 码 (lane 0..3)
+layout(std430, binding = 1) readonly buffer S { float ps[]; };   // r*nb+b
+layout(std430, binding = 2) readonly buffer A { uint act[]; };   // q8k_block (576 B = 144 uint): qp[256] @0, d @64, sum @65
+layout(std430, binding = 3) buffer O { float outv[]; };
+layout(push_constant) uniform P { uint rows, nb, nt, n_total, row0, shift, off, pad0; } pc;
+shared float red[64];
+
+void main() {
+    uint lr = gl_LocalInvocationID.x >> 3, lane = gl_LocalInvocationID.x & 7u;
+    uint r = gl_WorkGroupID.x * 8u + lr;
+    uint t = gl_WorkGroupID.y;
+    float acc = 0.0;
+    if (r < pc.rows) {
+        for (uint b = lane; b < pc.nb; b += 8u) {
+            uint wbase = (r * pc.nb + b) * 16u;
+            uint abase = (t * pc.nb + b) * 144u;
+            int enc = 0;
+            for (uint j = 0u; j < 4u; j++) {
+                for (uint wi = 0u; wi < 4u; wi++) {
+                    uint wv = pk[wbase + j * 4u + wi];
+                    for (uint l = 0u; l < 4u; l++) {
+                        int aw = int(act[abase + l * 16u + j * 4u + wi]);
+                        uint wl = wv >> (2u * l);
+                        enc += int(wl & 3u) * bitfieldExtract(aw, 0, 8);
+                        enc += int((wl >> 8) & 3u) * bitfieldExtract(aw, 8, 8);
+                        enc += int((wl >> 16) & 3u) * bitfieldExtract(aw, 16, 8);
+                        enc += int((wl >> 24) & 3u) * bitfieldExtract(aw, 24, 8);
+                    }
+                }
+            }
+            float d = uintBitsToFloat(act[abase + 64u]);
+            int sm = int(act[abase + 65u]);
+            acc += ps[r * pc.nb + b] * d * float((enc << int(pc.shift)) - int(pc.off) * sm);
+        }
+    }
+    red[gl_LocalInvocationID.x] = acc;
+    barrier();
+    if (lane == 0u && r < pc.rows) {
+        float s = 0.0;
+        for (uint i = 0u; i < 8u; i++) s += red[lr * 8u + i];
+        outv[t * pc.n_total + pc.row0 + r] = s;
+    }
+}
