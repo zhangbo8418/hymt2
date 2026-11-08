@@ -86,8 +86,9 @@ make bench           # 内核吞吐
 - CUDA：链入 fused 内核；`cudart` 为 delay-load，无 NVIDIA 运行库时仍可走 Vulkan/CPU。  
 Windows 上 `nvcc` 必须搭配 MSVC；CUDA 10.2（Win7 最后一版）支持 **VS 2015 / 2017 / 2019**。  
 GitHub Actions `windows-cuda` 产物：  
-- `hymt2-win7-universal`（CUDA 10.2 + Vulkan + CPU，子系统 6.1）  
-- `hymt2-win10-universal`（CUDA 12 + Vulkan + CPU）
+- `hymt2-win7-cpu-vulkan`（Win7：CPU + Vulkan，子系统 6.1；默认 auto）  
+- `hymt2-win7-cuda102`（可选：CUDA 10.2 通用包，安装工具链成功时才有）  
+- `hymt2-win10-universal`（Win10+：CUDA 12 + Vulkan + CPU）
 
 ## 测试 (均可在本目录运行)
 

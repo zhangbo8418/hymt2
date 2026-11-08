@@ -1,5 +1,6 @@
 # Universal Win64: CUDA + Vulkan + CPU. Runtime HYMT2_DEVICE=auto picks fastest.
-# CUDA 10.2 artifact is Win7-compatible (subsystem 6.1). Vulkan via vulkan-1.dll at runtime.
+# windows-2019 is scarce/removed on free runners — both jobs use windows-2022.
+# Win7 artifact still targets subsystem 6.1 + CUDA 10.2 when toolkit installs.
 name: windows-cuda
 
 on:
@@ -13,22 +14,51 @@ on:
       - 'CMakeLists.txt'
       - '.github/workflows/windows-cuda.yml'
       - 'scripts/ci_build_win_cuda.bat'
+      - 'scripts/ci_build_win_cpu_vulkan.bat'
       - 'scripts/build_win_cuda_msvc.bat'
 
 permissions:
   contents: read
 
 jobs:
-  universal-win7:
-    name: Win7 universal (CUDA 10.2 + Vulkan + CPU)
-    runs-on: windows-2019
+  # Primary Win7 deliverable: CPU + Vulkan (no CUDA toolkit). Runs fast on windows-2022.
+  # NVIDIA Win7 users can still force HYMT2_DEVICE=vulkan|cpu; CUDA needs local CUDA 10.2
+  # or the optional cuda102 job below.
+  win7-cpu-vulkan:
+    name: Win7 CPU+Vulkan universal
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup MSVC (VS2019 on windows-2019)
+      - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+
+      - name: Build
+        shell: cmd
+        run: scripts\ci_build_win_cpu_vulkan.bat
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hymt2-win7-cpu-vulkan
+          path: hymt2_cli.exe
+          if-no-files-found: error
+
+  # Optional: CUDA 10.2 on windows-2022 (may fail if toolkit rejects host OS).
+  cuda102-win7:
+    name: Win7 CUDA 10.2 attempt
+    runs-on: windows-2022
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.29'
 
       - name: Install CUDA 10.2
         uses: Jimver/cuda-toolkit@v0.2.23
@@ -46,7 +76,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hymt2-win7-universal
+          name: hymt2-win7-cuda102
           path: |
             hymt2_cli.exe
             cudart64_*.dll
