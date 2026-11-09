@@ -34,7 +34,7 @@ if not exist build_msvc mkdir build_msvc
 
 rem Universal: CUDA + Vulkan + CPU. Vulkan = LoadLibrary(vulkan-1.dll).
 rem CUDA delay-load so missing cudart still allows Vulkan/CPU.
-set CFLAGS=/nologo /O2 /MD /W3 /std:c11 /D_CRT_SECURE_NO_WARNINGS /DHYMT2_CUDA=1 /D_WIN32_WINNT=0x0601 /DWINVER=0x0601 /Ithird_party\vulkan /Isrc /Iinclude /I"%CUDA_INC%"
+set CFLAGS=/nologo /O2 /clang:-O3 /MD /W3 /std:c11 /D_CRT_SECURE_NO_WARNINGS /DHYMT2_CUDA=1 /D_WIN32_WINNT=0x0601 /DWINVER=0x0601 /Ithird_party\vulkan /Isrc /Iinclude /I"%CUDA_INC%"
 
 echo === nvcc ===
 nvcc -O3 -c -Xcompiler "/MD /nologo" -o build_msvc\cuda_kernels.obj src\cuda_kernels.cu

@@ -159,29 +159,17 @@ static float *load_vec(hymt2_model *m, const char *name, int n) {
 
 static void forward_batch(hymt2_model *m, const int *toks, int nt, int pos0, bool want_logits);
 
-/* 默认线程与原版 zip 一致: 逻辑核 + 封顶 8。
- * 物理核默认曾使 Win7 4c/8t 从 8→4 线程 (~23→16 tok/s)。
- * Android 仍用物理核并封顶 4 (小核/热节流)。 */
+/* 默认物理核 (与 Win7/J4125 实测一致; 逻辑超线程常更慢)。
+ * Android 另封顶 4。可用 HYMT2_THREADS 覆盖。 */
 static int default_threads(void) {
     const char *e = getenv("HYMT2_THREADS");
     if (e && atoi(e) > 0) return atoi(e);
-    long n = 1;
-#ifdef _WIN32
-    SYSTEM_INFO si; GetSystemInfo(&si); n = (long)si.dwNumberOfProcessors;
-#else
-    n = sysconf(_SC_NPROCESSORS_ONLN);
-#endif
-#if defined(__ANDROID__)
-    {
-        int phys = hy_physical_cpu_count();
-        if (phys > 0) n = phys;
-        if (n > 4) n = 4;
-    }
-#else
-    if (n > 8) n = 8;
-#endif
+    int n = hy_physical_cpu_count();
     if (n < 1) n = 1;
-    return (int)n;
+#if defined(__ANDROID__)
+    if (n > 4) n = 4;
+#endif
+    return n;
 }
 
 void hymt2_model_free(hymt2_model *m) {
@@ -434,7 +422,8 @@ static double step_calibrate_ms(hymt2_model *m, bool use_gpu) {
 }
 
 /* HYMT2_DEVICE: auto|cpu|cuda|metal|vulkan|nnapi|qnn|rkllm|hiai|npu|force|<n>
- * auto: cuda/metal 必须整网 fused 赢 CPU ≥10%; vulkan/npu 用 matmul 校准。输了就彻底放下, 不留假加速。 */
+ * auto: 仅 cuda/metal 整网 fused 且快过 CPU ≥10% 才启用; 无 fused 的 Vulkan/NPU 不自动上
+ * (避免误选慢路径, 也避免整步校准把随后的 CPU decode 烤慢)。 */
 static void setup_device(hymt2_model *m) {
     const char *pref = getenv("HYMT2_DEVICE");
     if (!pref || !*pref) pref = getenv("HYMT2_VK");
@@ -489,31 +478,27 @@ static void setup_device(hymt2_model *m) {
                 continue;
             }
         }
+        /* auto 只认整网 fused (CUDA/Metal)。Vulkan 等逐算子路径:
+         *  - 旧 matmul 校准会误选慢 GPU;
+         *  - 整步校准要先烤多轮 forward, Win7 上把随后 CPU decode 打成半速。
+         * 需要 Vulkan 时设 HYMT2_DEVICE=vulkan|force。 */
+        if (!hy_device_has_fused(d)) {
+            fprintf(stderr, "[hymt2] auto skip %s (%s): 无整网 fused, 不自动启用\n",
+                    hy_device_name(d), info[0] ? info : cands[i]);
+            hy_device_destroy(d);
+            continue;
+        }
         if (m->dev) gpu_drop(m);
         m->dev = d;
         if (!device_upload_all(m, verbose, false)) continue;
 
         if (cpu_ms < 0) cpu_ms = step_calibrate_ms(m, false);
 
-        if (hy_device_has_fused(m->dev)) {
-            if (enable_fused(m, verbose, false)) {
-                fprintf(stderr, "[hymt2] auto -> %s+fused (%s)\n", hy_device_name(d), info);
-                return;
-            }
-            fprintf(stderr, "[hymt2] %s fused 未优于 CPU, 继续\n", hy_device_name(d));
-            gpu_drop(m);
-            continue;
-        }
-
-        double ms = step_calibrate_ms(m, true);
-        fprintf(stderr, "[hymt2] 校准 %s 整步: %.1f ms vs CPU %.1f ms\n", hy_device_name(d), ms, cpu_ms);
-        if (m->use_gpu && ms < cpu_ms * 0.9) {
-            m->use_fused = false;
-            fprintf(stderr, "[hymt2] auto -> %s (整步 %.1f < CPU %.1f×0.9; %s)\n",
-                    hy_device_name(d), ms, cpu_ms, info);
+        if (enable_fused(m, verbose, false)) {
+            fprintf(stderr, "[hymt2] auto -> %s+fused (%s)\n", hy_device_name(d), info);
             return;
         }
-        fprintf(stderr, "[hymt2] %s 未优于 CPU, 继续\n", hy_device_name(d));
+        fprintf(stderr, "[hymt2] %s fused 未优于 CPU, 继续\n", hy_device_name(d));
         gpu_drop(m);
     }
     if (cpu_ms < 0)

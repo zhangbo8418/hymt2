@@ -14,7 +14,8 @@ clang-cl --version
 if not exist build_msvc mkdir build_msvc
 
 rem Win7-compatible CPU + Vulkan (no CUDA). Vulkan via LoadLibrary(vulkan-1.dll).
-set CFLAGS=/nologo /O2 /MD /W3 /std:c11 /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0601 /DWINVER=0x0601 /Ithird_party\vulkan /Isrc /Iinclude
+rem Match Makefile -O3; /O2 left measurable CPU decode on the table vs original zip.
+set CFLAGS=/nologo /O2 /clang:-O3 /MD /W3 /std:c11 /D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0601 /DWINVER=0x0601 /Ithird_party\vulkan /Isrc /Iinclude
 
 echo === clang-cl ===
 clang-cl %CFLAGS% /c /Fobuild_msvc\hymt2_cli.obj tools\hymt2_cli.c
