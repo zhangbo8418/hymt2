@@ -454,7 +454,8 @@ static void setup_device(hymt2_model *m) {
     }
 
     static const char *cands[] = { "cuda", "metal", "vulkan", "qnn", "nnapi", "rkllm", "hiai", NULL };
-    double cpu_ms = step_calibrate_ms(m, false);
+    /* 延迟 CPU 校准: 入门核显直接跳过时不要先烤 5 步 forward, 否则冷机 23→热机 14。 */
+    double cpu_ms = -1.0;
     for (int i = 0; cands[i]; i++) {
         char info[256] = "";
         hy_device *d = hy_device_try(cands[i], info, sizeof info);
@@ -480,6 +481,8 @@ static void setup_device(hymt2_model *m) {
         m->dev = d;
         if (!device_upload_all(m, verbose, false)) continue;
 
+        if (cpu_ms < 0) cpu_ms = step_calibrate_ms(m, false);
+
         if (hy_device_has_fused(m->dev)) {
             if (enable_fused(m, verbose, false)) {
                 fprintf(stderr, "[hymt2] auto -> %s+fused (%s)\n", hy_device_name(d), info);
@@ -501,7 +504,10 @@ static void setup_device(hymt2_model *m) {
         fprintf(stderr, "[hymt2] %s 未优于 CPU, 继续\n", hy_device_name(d));
         gpu_drop(m);
     }
-    fprintf(stderr, "[hymt2] auto -> cpu (无设备快过物理核 CPU 10%%; CPU %.1f ms/步)\n", cpu_ms);
+    if (cpu_ms < 0)
+        fprintf(stderr, "[hymt2] auto -> cpu (无可用加速设备)\n");
+    else
+        fprintf(stderr, "[hymt2] auto -> cpu (无设备快过物理核 CPU 10%%; CPU %.1f ms/步)\n", cpu_ms);
 }
 
 hymt2_model *hymt2_model_load(const char *path, int n_threads, int ctx_len, char *err, int err_cap) {
