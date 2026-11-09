@@ -159,17 +159,29 @@ static float *load_vec(hymt2_model *m, const char *name, int n) {
 
 static void forward_batch(hymt2_model *m, const int *toks, int nt, int pos0, bool want_logits);
 
-/* 默认物理核 (本机 4c 实测优于逻辑 8; 冷机可达 ~20 tok/s)。
- * 加载时不做整网前向校准 (会把 CPU 烤热, 把第一次测速打成半速)。 */
+/* 默认线程与原版 zip 一致: 逻辑核 + 封顶 8。
+ * 物理核默认曾使 Win7 4c/8t 从 8→4 线程 (~23→16 tok/s)。
+ * Android 仍用物理核并封顶 4 (小核/热节流)。 */
 static int default_threads(void) {
     const char *e = getenv("HYMT2_THREADS");
     if (e && atoi(e) > 0) return atoi(e);
-    int n = hy_physical_cpu_count();
-    if (n < 1) n = 1;
-#if defined(__ANDROID__)
-    if (n > 4) n = 4;
+    long n = 1;
+#ifdef _WIN32
+    SYSTEM_INFO si; GetSystemInfo(&si); n = (long)si.dwNumberOfProcessors;
+#else
+    n = sysconf(_SC_NPROCESSORS_ONLN);
 #endif
-    return n;
+#if defined(__ANDROID__)
+    {
+        int phys = hy_physical_cpu_count();
+        if (phys > 0) n = phys;
+        if (n > 4) n = 4;
+    }
+#else
+    if (n > 8) n = 8;
+#endif
+    if (n < 1) n = 1;
+    return (int)n;
 }
 
 void hymt2_model_free(hymt2_model *m) {
